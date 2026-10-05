@@ -1,0 +1,519 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 13 · Design a Search Autocomplete System — SDI Fast Track</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem("sdi:theme");if(t)document.documentElement.dataset.theme=JSON.parse(t)}catch(e){}</script>
+</head>
+<body data-root=".." data-chapter="13">
+<main id="content" class="chapter">
+
+<header class="chapter-hero">
+  <p class="eyebrow">Chapter 13 · Design problem</p>
+  <h1>Design a Search Autocomplete System</h1>
+  <p class="lede">How to return the 5 most popular completions for any prefix in under 100 ms: a trie that caches the top queries at every node, rebuilt weekly from aggregated logs, served from a cache, and sharded by prefix.</p>
+  <div class="meta-row"></div>
+  <ul class="pace">
+    <li><a href="#tldr">⚡ TL;DR <small>2 min</small></a></li>
+    <li><a href="#skeleton">🗣 Interview answer <small>3 min</small></a></li>
+    <li><a href="#step-1">📖 Full walkthrough</a></li>
+    <li><a href="#self-test">🧠 Self-test</a></li>
+  </ul>
+</header>
+
+<section id="tldr" class="tldr">
+  <h2>TL;DR</h2>
+  <ul>
+    <li><b>Problem:</b> return the <b>top 5</b> most-searched past queries that <b>start with</b> the typed prefix ("top k"). English, lowercase, no spell check, 10M DAU.</li>
+    <li><b>Requirements:</b> respond in <b>under 100 ms</b>, relevant, sorted by popularity, scalable, highly available.</li>
+    <li><b>Numbers:</b> one request per keystroke (~20 per search) → <b>~24,000 QPS</b>, <b>~48,000 peak</b>; <b>0.4 GB</b> of new data per day.</li>
+    <li><b>Naive version:</b> a frequency table plus <code>LIKE 'prefix%' ORDER BY frequency DESC LIMIT 5</code>. The database becomes the bottleneck.</li>
+    <li><b>Core: a trie</b> with prefix length capped (~50) and the <b>top 5 queries cached at every node</b>. Lookup drops from O(p + c + c log c) to <b>O(1)</b>: space traded for time.</li>
+    <li><b>Build offline, weekly:</b> analytics logs → aggregators → aggregated data → workers → Trie DB → Trie Cache.</li>
+    <li><b>Serve:</b> load balancer → API servers → Trie Cache (miss → Trie DB), plus AJAX, browser caching and log sampling.</li>
+    <li><b>Operate:</b> rebuild weekly and swap; hide bad suggestions with a <b>filter layer</b>. Shard by prefix via a <b>shard map manager</b>, since first-letter sharding is uneven.</li>
+  </ul>
+  <figure class="fig">
+    <img src="../assets/img/p-210-173.jpg" alt="Trie where every node stores its top 5 queries, for example node be stores best 35, bet 29, bee 20, be 15, beer 10">
+    <figcaption><b>Figure 13-8</b> · Every node carries its own top-5 list, so answering a prefix is one node lookup.</figcaption>
+  </figure>
+</section>
+
+<section id="skeleton">
+  <h2>Interview answer skeleton</h2>
+  <p class="one-liner">If asked this in an interview, walk through these four beats. Each maps to a section below.</p>
+  <ol class="framework">
+    <li><b>Clarify (≈5 min)</b> Prefix match only? How many suggestions (5)? Ranked how (historical frequency)? Spell check (no)? Language (English, lowercase)? Scale (10M DAU)? State the goals: under 100 ms, relevant, sorted, scalable, highly available. Estimate ~24k QPS, ~48k peak, 0.4 GB/day.</li>
+    <li><b>High level (≈10 min)</b> A data gathering service updates a query → frequency table. A query service runs a top-5 SQL query for the prefix. Say why this won't scale.</li>
+    <li><b>Deep dive (≈20 min)</b> Trie with capped prefix length and top-k cached per node, so lookup is O(1). Weekly pipeline: logs → aggregators → workers → Trie DB → Trie Cache. Query flow plus AJAX, browser cache, sampling. Update by rebuild; delete with a filter layer. Shard by prefix with a shard map manager.</li>
+    <li><b>Wrap up (≈5 min)</b> Unicode tries for other languages, per-country tries on CDNs, trending queries via stream processing.</li>
+  </ol>
+</section>
+
+<section id="step-1">
+  <h2><span class="step-num">Step 1</span>Understand the problem and establish design scope</h2>
+  <p class="one-liner">The task is <b>prefix → top 5 popular queries</b>, fast, at 10M DAU.</p>
+  <p>The feature goes by several names: <b>autocomplete</b>, <b>typeahead</b>, <b>search-as-you-type</b> or <b>incremental search</b>. Interviewers also call it "design top k" or "design top k most searched queries".</p>
+  <figure class="fig small">
+    <img src="../assets/img/p-200-164.jpg" alt="Google search box with dinner typed and ten suggestions such as dinner ideas, dinner recipes, dinner near me">
+    <figcaption><b>Figure 13-1</b> · Typing "dinner" on Google: each suggestion starts with exactly what was typed.</figcaption>
+  </figure>
+  <table class="qa-table">
+    <tr><th>You ask</th><th>Interviewer says</th></tr>
+    <tr><td>Is matching only at the beginning of a query, or in the middle too?</td><td>Only at the beginning.</td></tr>
+    <tr><td>How many suggestions should the system return?</td><td>5.</td></tr>
+    <tr><td>How does the system know which 5 to return?</td><td>By popularity, decided by historical query frequency.</td></tr>
+    <tr><td>Do we support spell check?</td><td>No spell check or autocorrect.</td></tr>
+    <tr><td>Are queries in English?</td><td>Yes. Multi-language support can come at the end if time allows.</td></tr>
+    <tr><td>Do we allow capital letters and special characters?</td><td>No. Assume all queries are lowercase alphabetic characters.</td></tr>
+    <tr><td>How many users?</td><td>10 million DAU.</td></tr>
+  </table>
+  <h4>Requirements</h4>
+  <ul class="checklist">
+    <li><b>Fast response time:</b> suggestions must appear as the user types. Facebook's autocomplete article says results must come back <b>within 100 ms</b>, or the UI stutters.</li>
+    <li><b>Relevant:</b> suggestions relate to the search term.</li>
+    <li><b>Sorted:</b> results are ordered by popularity or another ranking model.</li>
+    <li><b>Scalable:</b> handles high traffic volume.</li>
+    <li><b>Highly available:</b> stays available when part of the system is offline, slows down, or hits unexpected network errors.</li>
+  </ul>
+
+  <h3>Back-of-the-envelope estimation</h3>
+  <ul>
+    <li><b>10 million DAU</b>, each doing <b>10 searches per day</b>.</li>
+    <li><b>20 bytes per query string:</b> ASCII, so 1 character = 1 byte. A query averages 4 words × 5 characters = 20 characters = 20 bytes.</li>
+    <li><b>20 requests per search:</b> the client sends a request for <b>every character typed</b>. Typing "dinner" alone sends 6:</li>
+  </ul>
+<pre><code>search?q=d
+search?q=di
+search?q=din
+search?q=dinn
+search?q=dinne
+search?q=dinner</code></pre>
+<pre><code>QPS     = 10,000,000 users × 10 queries/day × 20 characters ÷ (24 h × 3,600 s)
+        = 2,000,000,000 ÷ 86,400 ≈ 23,150        → book rounds to ~24,000
+Peak    = QPS × 2                                ≈ ~48,000
+Storage = 10,000,000 × 10 queries × 20 bytes × 20% new
+        = 400,000,000 bytes                      = 0.4 GB of new data per day</code></pre>
+  <div class="stats">
+    <div class="stat"><b>~24,000</b><span>QPS (exact ≈ 23,150)</span></div>
+    <div class="stat"><b>~48,000</b><span>peak QPS (2×)</span></div>
+    <div class="stat"><b>0.4 GB</b><span>new data per day (20% of queries are new)</span></div>
+    <div class="stat"><b>&lt; 100 ms</b><span>response time target</span></div>
+  </div>
+  <aside class="callout tip">
+    <span class="callout-label">Say this in the interview</span>
+    <p>"QPS is 20× the search rate, because <b>every keystroke is a request</b>. That's why the read path has to be close to a constant-time lookup."</p>
+  </aside>
+</section>
+
+<section id="step-2">
+  <h2><span class="step-num">Step 2</span>Propose high-level design and get buy-in</h2>
+  <p class="one-liner">Two services: a <b>data gathering service</b> that counts queries and a <b>query service</b> that returns the top 5 for a prefix.</p>
+  <ul>
+    <li><b>Data gathering service:</b> gathers user queries and aggregates them in real time. Real-time processing isn't practical for large data sets, but it's a good starting point; the deep dive replaces it.</li>
+    <li><b>Query service:</b> given a search query or prefix, returns the 5 most frequently searched terms.</li>
+  </ul>
+
+  <h3>Data gathering service</h3>
+  <p>Keep a <b>frequency table</b> of query string → count. It starts empty. When users enter "twitch", "twitter", "twitter" and "twillo" in that order, it changes like this (Figure 13-2):</p>
+  <table>
+    <tr><th>After query</th><th>Frequency table</th></tr>
+    <tr><td><i>(start)</i></td><td><i>empty</i></td></tr>
+    <tr><td>twitch</td><td>twitch: 1</td></tr>
+    <tr><td>twitter</td><td>twitch: 1, twitter: 1</td></tr>
+    <tr><td>twitter</td><td>twitch: 1, twitter: <b>2</b></td></tr>
+    <tr><td>twillo</td><td>twitch: 1, twitter: 2, twillo: 1</td></tr>
+  </table>
+
+  <h3>Query service</h3>
+  <p>The table has two fields: <b>query</b> (the query string) and <b>frequency</b> (how many times it has been searched).</p>
+  <table>
+    <tr><th>Query</th><th>Frequency</th><th>Shown for "tw"?</th></tr>
+    <tr><td>twitter</td><td>35</td><td class="yes">✓ 1st</td></tr>
+    <tr><td>twitch</td><td>29</td><td class="yes">✓ 2nd</td></tr>
+    <tr><td>twilight</td><td>25</td><td class="yes">✓ 3rd</td></tr>
+    <tr><td>twin peak</td><td>21</td><td class="yes">✓ 4th</td></tr>
+    <tr><td>twitch prime</td><td>18</td><td class="yes">✓ 5th</td></tr>
+    <tr><td>twitter search</td><td>14</td><td class="no">✗</td></tr>
+    <tr><td>twillo</td><td>10</td><td class="no">✗</td></tr>
+    <tr><td>twin peak sf</td><td>8</td><td class="no">✗</td></tr>
+  </table>
+  <p>Table 13-1 with Figure 13-3: typing "tw" shows <b>twitter, twitch, twilight, twin peak, twitch prime</b>. To get them, run this query (Figure 13-4):</p>
+<pre><code>SELECT * FROM frequency_table
+WHERE query LIKE 'prefix%'
+ORDER BY frequency DESC
+LIMIT 5</code></pre>
+  <p style="font-size:15px;color:var(--ink-3)">The book's figure puts backticks around <code>prefix%</code>. In SQL a string literal takes single quotes, as shown here.</p>
+  <aside class="callout warn">
+    <span class="callout-label">Pitfall</span>
+    <p>This is fine for a small data set. At scale, <b>database access becomes the bottleneck</b>: every keystroke runs a prefix match plus a sort. The deep dive fixes this.</p>
+  </aside>
+</section>
+
+<section id="step-3">
+  <h2><span class="step-num">Step 3</span>Design deep dive</h2>
+  <p class="one-liner">Replace the table with a <b>trie that caches top k per node</b>, build it offline, serve it from a cache, and shard it.</p>
+  <p>Five areas to cover: the trie data structure, the data gathering service, the query service, trie operations, and scaling the storage.</p>
+
+  <h3>Trie data structure</h3>
+  <p>Fetching the top 5 from a relational database is inefficient; use a <b>trie</b> (prefix tree) instead. The basic trie is a data-structure question, so cover it briefly and spend your time on the optimizations.</p>
+  <p>A trie (pronounced "try", from re<b>trie</b>val) stores strings compactly and is built for string retrieval:</p>
+  <ul>
+    <li>It is a tree-like data structure.</li>
+    <li>The <b>root</b> represents the empty string.</li>
+    <li>Each node stores a character and has <b>26 children</b>, one per letter. Empty links aren't drawn.</li>
+    <li>Each node represents a single word or a prefix.</li>
+  </ul>
+  <figure class="fig">
+    <img src="../assets/img/p-207-169.jpg" alt="Trie for tree, try, true, toy, wish, win; root branches into t and w, then tr, to, wi and so on">
+    <figcaption><b>Figure 13-5</b> · Trie for "tree", "try", "true", "toy", "wish", "win". Thick borders mark complete queries; other nodes are just prefixes.</figcaption>
+  </figure>
+  <p>To sort by popularity, store each query's <b>frequency</b> in its node. With this frequency table (Table 13-2):</p>
+  <table>
+    <tr><th>Query</th><th>tree</th><th>try</th><th>true</th><th>toy</th><th>wish</th><th>win</th></tr>
+    <tr><td><b>Frequency</b></td><td>10</td><td>29</td><td>35</td><td>14</td><td>25</td><td>50</td></tr>
+  </table>
+  <figure class="fig">
+    <img src="../assets/img/p-208-171.jpg" alt="Same trie with frequencies on word nodes: tree 10, true 35, try 29, toy 14, wish 25, win 50">
+    <figcaption><b>Figure 13-6</b> · Same trie, now with a frequency on every query node.</figcaption>
+  </figure>
+
+  <h4>Getting the top k: the basic algorithm</h4>
+  <p>Let <b>p</b> = length of the prefix, <b>n</b> = total nodes in the trie, <b>c</b> = number of children of a given node.</p>
+  <ol class="flow">
+    <li><b>Find the prefix node.</b> O(p).</li>
+    <li><b>Traverse its subtree</b> to collect all valid children (nodes that form a real query). O(c).</li>
+    <li><b>Sort the children and take the top k.</b> O(c log c).</li>
+  </ol>
+  <p>Example with k = 2 and the prefix "tr": find node "tr", collect [tree: 10], [true: 35], [try: 29], sort, and return <b>[true: 35, try: 29]</b>. Total cost: <b>O(p) + O(c) + O(c log c)</b>.</p>
+  <figure class="fig">
+    <img src="../assets/img/p-209-172.jpg" alt="Top 2 for prefix be: walk root to b to be, gather bee 20, beer 10, best 35, bet 29, return best 35 and bet 29">
+    <figcaption><b>Figure 13-7</b> · Same steps for prefix "be": (1) walk to "be", (2) gather its subtree, (3) top 2 = [best: 35, bet: 29]. (The book's text uses "tr"; its figure uses "be".)</figcaption>
+  </figure>
+  <p>This is too slow: in the worst case you traverse the <b>entire trie</b> to answer one request. Two optimizations fix it.</p>
+
+  <h4>Optimization 1 · Limit the max length of a prefix</h4>
+  <p>Users rarely type long queries, so cap p at a small number such as <b>50</b>. "Find the prefix" drops from O(p) to O(small constant), i.e. <b>O(1)</b>.</p>
+
+  <h4>Optimization 2 · Cache top search queries at each node</h4>
+  <p>Store the <b>top k most frequent queries at every node</b> so you never traverse the subtree. 5 to 10 suggestions are enough for users, so k is small; here only the <b>top 5</b> are cached. For example, node "be" stores [best: 35, bet: 29, bee: 20, be: 15, beer: 10].</p>
+  <figure class="fig">
+    <img src="../assets/img/p-210-173.jpg" alt="Trie where each node has a dashed box with its top queries; node b stores best 35, bet 29, bee 20, be 15, buy 14">
+    <figcaption><b>Figure 13-8</b> · The dashed box beside each node is its cached top list. Answering "be" means reading one box; no subtree walk.</figcaption>
+  </figure>
+  <aside class="callout key">
+    <span class="callout-label">Key idea</span>
+    <p>Caching top k at every node costs a lot of space, but it makes every lookup a single node read. <b>Trading space for time is worth it</b> because fast response is the top requirement.</p>
+  </aside>
+  <table>
+    <tr><th>Step</th><th>Basic trie</th><th>Optimized trie</th></tr>
+    <tr><td>Find the prefix node</td><td>O(p)</td><td><b>O(1)</b> (prefix length capped)</td></tr>
+    <tr><td>Collect valid children</td><td>O(c)</td><td>Not needed</td></tr>
+    <tr><td>Sort and take top k</td><td>O(c log c)</td><td><b>O(1)</b> (return the cached list)</td></tr>
+    <tr><td><b>Total</b></td><td>O(p) + O(c) + O(c log c)</td><td><b>O(1)</b></td></tr>
+  </table>
+
+  <div class="demo" id="ac-demo">
+    <span class="demo-title">Try it · Trie with cached top-k</span>
+    <p style="font-size:15px;margin-bottom:10px">Type a prefix: its path lights up, and the answer is that node's cached list. <b>Search it</b> adds one search for the typed word and recomputes every ancestor's cache. Data: Table 13-2 plus the "b" words of Figure 13-8.</p>
+    <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:12px">
+      <input id="ac-in" value="be" maxlength="50" autocomplete="off" spellcheck="false" aria-label="Prefix" style="flex:1;min-width:160px">
+      <label>k <select id="ac-k"><option>1</option><option selected>2</option><option>3</option><option>4</option><option>5</option></select></label>
+      <button class="btn" id="ac-rec" type="button">Search it (+1)</button>
+    </div>
+    <div class="out" id="ac-out" style="line-height:1.8"></div>
+    <div class="out" id="ac-tree" style="display:flex;flex-wrap:wrap;gap:4px 32px;margin-top:12px;line-height:1.6"></div>
+  </div>
+
+  <h3>Data gathering service</h3>
+  <p>Updating the trie in real time on every query is <b>not practical</b>:</p>
+  <ul>
+    <li>Users may enter <b>billions of queries per day</b>. Updating the trie on each one significantly slows down the query service.</li>
+    <li>Top suggestions <b>may not change much</b> once the trie is built, so frequent updates are unnecessary.</li>
+  </ul>
+  <p>Freshness needs vary: Twitter needs up-to-date suggestions, while many Google keywords barely change day to day. Either way the trie is built from <b>analytics or logging data</b>, so the pipeline has the same shape.</p>
+  <figure class="fig">
+    <img src="../assets/img/p-211-174.jpg" alt="Pipeline: Analytics Logs to Aggregators to Aggregated Data to Workers, which update Trie DB weekly; Trie Cache takes a weekly snapshot of Trie DB">
+    <figcaption><b>Figure 13-9</b> · The redesigned data gathering service. Workers write the Trie DB weekly; the Trie Cache snapshots it weekly.</figcaption>
+  </figure>
+
+  <h4>Analytics logs</h4>
+  <p>Raw data about search queries. <b>Append-only and not indexed.</b> Example (Table 13-3):</p>
+  <table>
+    <tr><th>query</th><th>time</th></tr>
+    <tr><td>tree</td><td>2019-10-01 22:01:01</td></tr>
+    <tr><td>try</td><td>2019-10-01 22:01:05</td></tr>
+    <tr><td>tree</td><td>2019-10-01 22:01:30</td></tr>
+    <tr><td>toy</td><td>2019-10-01 22:02:22</td></tr>
+    <tr><td>tree</td><td>2019-10-02 22:02:42</td></tr>
+    <tr><td>try</td><td>2019-10-03 22:03:03</td></tr>
+  </table>
+
+  <h4>Aggregators</h4>
+  <p>Logs are huge and in the wrong format, so aggregators summarize them. The interval depends on the use case: <b>short intervals</b> for real-time apps like Twitter; <b>once a week</b> is enough for many others. This design assumes the trie is <b>rebuilt weekly</b>.</p>
+  <aside class="callout tip">
+    <span class="callout-label">Say this in the interview</span>
+    <p>Ask whether real-time results matter. The answer decides the aggregation interval, and with it the whole pipeline.</p>
+  </aside>
+
+  <h4>Aggregated data</h4>
+  <p>Weekly totals per query (Table 13-4). <code>time</code> is the start of the week; <code>frequency</code> is the sum of that query's occurrences in the week.</p>
+  <table>
+    <tr><th>query</th><th>time</th><th>frequency</th></tr>
+    <tr><td>tree</td><td>2019-10-01</td><td>12000</td></tr>
+    <tr><td>tree</td><td>2019-10-08</td><td>15000</td></tr>
+    <tr><td>tree</td><td>2019-10-15</td><td>9000</td></tr>
+    <tr><td>toy</td><td>2019-10-01</td><td>8500</td></tr>
+    <tr><td>toy</td><td>2019-10-08</td><td>6256</td></tr>
+    <tr><td>toy</td><td>2019-10-15</td><td>8866</td></tr>
+  </table>
+
+  <h4>Workers</h4>
+  <p>A set of servers that run <b>asynchronous jobs at regular intervals</b>. They build the trie and store it in the Trie DB.</p>
+
+  <h4>Trie Cache</h4>
+  <p>A <b>distributed cache</b> that keeps the trie in memory for fast reads. It takes a <b>weekly snapshot</b> of the Trie DB.</p>
+
+  <h4>Trie DB</h4>
+  <p>The persistent storage. Two options:</p>
+  <table>
+    <tr><th>Option</th><th>How the trie is stored</th><th>Notes</th></tr>
+    <tr><td><b>Document store</b></td><td>A new trie is built weekly, so periodically take a snapshot, <b>serialize</b> it and store the serialized data.</td><td>Document stores like <b>MongoDB</b> are good fits for serialized data.</td></tr>
+    <tr><td><b>Key-value store</b></td><td>Represent the trie as a hash table: <b>every prefix → a key</b>, and <b>the data on that node → its value</b>.</td><td>See Chapter 6 (key-value store) for how these work.</td></tr>
+  </table>
+  <figure class="fig">
+    <img src="../assets/img/p-213-177.jpg" alt="Trie nodes b, be, bee, bes, beer, best mapped to key-value rows; key is the prefix, value is the node's cached top queries">
+    <figcaption><b>Figure 13-10</b> · Each trie node becomes one key-value pair: key = the prefix ("b", "be", "bee"…), value = that node's stored queries and frequencies.</figcaption>
+  </figure>
+
+  <h3>Query service</h3>
+  <p>Instead of calling the database directly, the improved flow reads from the Trie Cache:</p>
+  <figure class="fig small">
+    <img src="../assets/img/p-214-178.jpg" alt="User on web or mobile calls load balancer (1), which routes to API servers (2), which read Trie Cache (3), which falls back to Trie DB (4)">
+    <figcaption><b>Figure 13-11</b> · The numbered arrows match the steps below.</figcaption>
+  </figure>
+  <ol class="flow">
+    <li>A search query is sent to the <b>load balancer</b>.</li>
+    <li>The load balancer routes the request to <b>API servers</b>.</li>
+    <li>API servers get trie data from the <b>Trie Cache</b> and build the autocomplete suggestions for the client.</li>
+    <li>If the data isn't in the Trie Cache, it is <b>replenished from the Trie DB</b>, so later requests for the same prefix are served from the cache. A cache miss happens when a cache server is <b>out of memory or offline</b>.</li>
+  </ol>
+  <h4>Optimizations for lightning-fast responses</h4>
+  <p><b>AJAX requests.</b> Web apps fetch suggestions with AJAX, so sending a request and receiving the response doesn't refresh the whole page.</p>
+  <p><b>Browser caching.</b> Suggestions rarely change within a short time, so save them in the browser cache and serve repeat requests from there. Google does this. Its response headers when you type "system design interview" (Figure 13-12):</p>
+<pre><code>Request URL: https://www.google.com/complete/search?q&amp;cp=0&amp;client=psy-ab&amp;xssi=t&amp;gs_ri=gws-wiz&amp;hl=en&amp;authuser=0&amp;pq=system design interview
+Request method: GET
+Remote address: [2607:f8b0:4005:807::2004]:443
+Status code: 200 OK
+Version: HTTP/2.0
+
+Response headers (615 B)
+alt-svc: quic=":443"; ma=2592000; v="46...00,h3-Q043=":443"; ma=2592000
+<mark>cache-control: private, max-age=3600</mark>
+content-disposition: attachment; filename="f.txt"
+content-encoding: br
+content-type: application/json; charset=UTF-8
+date: Tue, 17 Dec 2019 22:52:01 GMT
+expires: Tue, 17 Dec 2019 22:52:01 GMT
+server: gws
+strict-transport-security: max-age=31536000
+trailer: X-Google-GFE-Current-Request-Cost-From-GWS
+X-Firefox-Spdy: h2
+x-frame-options: SAMEORIGIN
+x-xss-protection: 0</code></pre>
+  <p>Read the highlighted line. Google caches results in the browser for an hour: <code>private</code> means the result is for a single user and <b>must not be stored in a shared cache</b>; <code>max-age=3600</code> means it is valid for 3,600 seconds, i.e. <b>1 hour</b>.</p>
+  <p><b>Data sampling.</b> Logging every query at large scale takes a lot of processing power and storage. Log only <b>1 out of every N requests</b>.</p>
+  <aside class="callout note">
+    <span class="callout-label">Beyond the book</span>
+    <p>Clients usually also <b>debounce</b> input: they wait for a short pause in typing before sending a request, and ignore responses for prefixes the user has already typed past. This cuts the "one request per keystroke" load the estimate assumes.</p>
+  </aside>
+
+  <h3>Trie operations</h3>
+  <h4>Create</h4>
+  <p>Workers build the trie from the aggregated data. The source is the analytics log/DB.</p>
+  <h4>Update</h4>
+  <table>
+    <tr><th>Option</th><th>How</th><th>When</th></tr>
+    <tr><td><b>1 · Rebuild weekly</b></td><td>Build a new trie; it replaces the old one.</td><td>The default in this design.</td></tr>
+    <tr><td><b>2 · Update individual nodes</b></td><td>Change the node, then update <b>every ancestor up to the root</b>, because ancestors store the top queries of their children.</td><td>Slow, so avoid it. Acceptable when the trie is small.</td></tr>
+  </table>
+  <figure class="fig">
+    <img src="../assets/img/p-216-180.jpg" alt="Before and after: beer frequency changes from 10 to 30, and the cached lists on bee, be and b all change to include beer 30">
+    <figcaption><b>Figure 13-13</b> · Updating "beer" from 10 to 30: the node and all its ancestors ("bee", "be", "b") must rewrite their cached lists.</figcaption>
+  </figure>
+  <h4>Delete</h4>
+  <p>Hateful, violent, sexually explicit or dangerous suggestions must be removed. Put a <b>filter layer</b> in front of the Trie Cache; it lets you remove results with different filter rules. The unwanted suggestions are also <b>physically removed from the database asynchronously</b>, so the next build cycle uses the correct data set.</p>
+  <figure class="fig">
+    <img src="../assets/img/p-216-181.jpg" alt="Trie Cache feeds a Filter Layer, which feeds API servers">
+    <figcaption><b>Figure 13-14</b> · Results pass through the filter layer between the Trie Cache and the API servers.</figcaption>
+  </figure>
+
+  <h3>Scale the storage</h3>
+  <p>When the trie grows too large for one server, shard it. Since only English is supported, the naive way is to <b>shard by first character</b>:</p>
+  <table>
+    <tr><th>Servers</th><th>Split</th></tr>
+    <tr><td>2</td><td>'a'–'m' and 'n'–'z'</td></tr>
+    <tr><td>3</td><td>'a'–'i', 'j'–'r' and 's'–'z'</td></tr>
+    <tr><td>Up to 26</td><td>One letter per server (<b>first-level sharding</b>)</td></tr>
+    <tr><td>More than 26</td><td>Shard on the second or third character. Queries starting with 'a' could go to 4 servers: 'aa'–'ag', 'ah'–'an', 'ao'–'au', 'av'–'az'.</td></tr>
+  </table>
+  <aside class="callout warn">
+    <span class="callout-label">Pitfall</span>
+    <p>Far more words start with 'c' than with 'x', so first-character sharding gives an <b>uneven distribution</b>.</p>
+  </aside>
+  <p>To fix the imbalance, <b>analyze the historical distribution</b> and shard smarter. A <b>shard map manager</b> keeps a lookup database of where rows are stored. If 's' gets about as many historical queries as 'u' through 'z' combined, use two shards: one for 's' and one for 'u'–'z'.</p>
+  <figure class="fig medium">
+    <img src="../assets/img/p-217-182.jpg" alt="Web servers ask the shard map manager which shard (1), then retrieve data from that database shard (2)">
+    <figcaption><b>Figure 13-15</b> · (1) Ask the shard map manager which shard holds the prefix, (2) read from that shard.</figcaption>
+  </figure>
+</section>
+
+<section id="step-4">
+  <h2><span class="step-num">Step 4</span>Wrap up</h2>
+  <p class="one-liner">Expect follow-ups on <b>languages, countries and trending queries</b>.</p>
+  <ul>
+    <li><b>"How do you support multiple languages?"</b> Store <b>Unicode</b> characters in trie nodes. Unicode is "an encoding standard [that] covers all the characters for all the writing systems of the world, modern and ancient".</li>
+    <li><b>"What if top queries differ by country?"</b> Build <b>different tries for different countries</b>, and store them in <b>CDNs</b> to improve response time.</li>
+    <li><b>"How do you support trending (real-time) queries?"</b> When news breaks and a query suddenly becomes popular, the design fails: the offline workers only run weekly, and even if scheduled, building the trie takes too long. Real-time autocomplete is beyond the book's scope, but some ideas:
+      <ul>
+        <li>Reduce the working data set by <b>sharding</b>.</li>
+        <li>Change the ranking model to give <b>more weight to recent queries</b>.</li>
+        <li>Data may arrive as <b>streams</b> (generated continuously), so you don't have it all at once. That needs different systems: Apache Hadoop MapReduce, <b>Apache Spark Streaming</b>, <b>Apache Storm</b>, <b>Apache Kafka</b>. Strictly, Hadoop MapReduce is a batch framework; Spark Streaming and Storm are the stream processors, and Kafka is the event log that typically feeds them.</li>
+      </ul>
+    </li>
+  </ul>
+</section>
+
+<section id="self-test">
+  <h2>Self-test</h2>
+  <details class="qa"><summary>What are the five requirements, and what is the latency target?</summary><div><p>Fast response (within <b>100 ms</b>, per Facebook's typeahead article, or it stutters), relevant, sorted by popularity, scalable, and highly available.</p></div></details>
+  <details class="qa"><summary>Walk through the QPS and storage estimates.</summary><div><p>10M DAU × 10 searches × 20 requests (one per character) ÷ 86,400 s ≈ <b>~24,000 QPS</b>; peak ×2 ≈ <b>~48,000</b>. Storage: 10M × 10 × 20 bytes × 20% new = <b>0.4 GB/day</b>.</p></div></details>
+  <details class="qa"><summary>Why are there about 20 requests per search query?</summary><div><p>The client requests suggestions on every character typed, and an average query is 4 words × 5 characters = 20 characters.</p></div></details>
+  <details class="qa"><summary>What does the high-level query service run, and why doesn't it scale?</summary><div><p><code>SELECT * FROM frequency_table WHERE query LIKE 'prefix%' ORDER BY frequency DESC LIMIT 5</code>. On a large data set, database access becomes the bottleneck.</p></div></details>
+  <details class="qa"><summary>What are the steps and time complexity of the basic trie top-k algorithm?</summary><div><p>Find the prefix node O(p), traverse its subtree for valid children O(c), sort and take top k O(c log c). Total O(p) + O(c) + O(c log c); the worst case traverses the whole trie.</p></div></details>
+  <details class="qa"><summary>Which two optimizations make lookup O(1), and what do they cost?</summary><div><p>Cap the prefix length (e.g. 50), making find O(1), and cache the top k (5) queries at every node, making retrieval O(1). The cost is a lot of extra space, which is worth it for fast responses.</p></div></details>
+  <details class="qa"><summary>Why not update the trie in real time on every query?</summary><div><p>Billions of queries a day would significantly slow down the query service, and top suggestions don't change much once the trie is built.</p></div></details>
+  <details class="qa"><summary>Name the components of the data gathering pipeline, in order.</summary><div><p>Analytics logs → aggregators → aggregated data → workers → Trie DB → Trie Cache (weekly snapshot of the DB).</p></div></details>
+  <details class="qa"><summary>What are the two options for storing the trie in the Trie DB?</summary><div><p>A document store (e.g. MongoDB) holding a serialized weekly snapshot, or a key-value store where every prefix is a key and that node's data is the value.</p></div></details>
+  <details class="qa"><summary>Describe the query service flow, including a cache miss.</summary><div><p>Load balancer → API servers → Trie Cache, which builds the suggestions. On a miss (cache server out of memory or offline), data is replenished from the Trie DB so later requests for that prefix hit the cache.</p></div></details>
+  <details class="qa"><summary>What do <code>cache-control: private, max-age=3600</code> mean for autocomplete results?</summary><div><p><code>private</code>: for a single user only, not to be stored in a shared cache. <code>max-age=3600</code>: valid for 3,600 seconds (1 hour) in the browser cache.</p></div></details>
+  <details class="qa"><summary>Why is updating a single trie node expensive, and what's the preferred update method?</summary><div><p>Every ancestor up to the root caches its descendants' top queries, so all of them must be updated too. Prefer rebuilding the trie weekly and replacing the old one.</p></div></details>
+  <details class="qa"><summary>How do you remove harmful suggestions?</summary><div><p>A filter layer in front of the Trie Cache removes them using configurable rules, and they are physically deleted from the database asynchronously so the next build excludes them.</p></div></details>
+  <details class="qa"><summary>What's wrong with sharding by first character, and how do you fix it?</summary><div><p>Distribution is uneven (far more words start with 'c' than 'x'). Use historical data to balance shards (e.g. 's' alone vs 'u'–'z' together) and a shard map manager to look up which shard holds a prefix.</p></div></details>
+  <details class="qa"><summary>Why does the design fail for trending queries, and what helps?</summary><div><p>Workers rebuild only weekly and building takes too long. Ideas: shard to shrink the working set, weight recent queries more in ranking, and use stream processing (Spark Streaming, Storm, Kafka).</p></div></details>
+</section>
+
+<section id="glossary">
+  <h2>Terms to know</h2>
+  <dl class="glossary">
+    <dt>Autocomplete</dt><dd>Suggesting completions as the user types. Also called typeahead, search-as-you-type or incremental search.</dd>
+    <dt>Trie</dt><dd>Prefix tree: each node is a character, each path from the root spells a prefix. Pronounced "try", from re<i>trie</i>val.</dd>
+    <dt>Top k</dt><dd>The k most frequent queries for a prefix (k = 5 here).</dd>
+    <dt>Frequency table</dt><dd>Query string → how many times it was searched.</dd>
+    <dt>Aggregator</dt><dd>A job that turns raw, unindexed logs into per-query counts over an interval (weekly here).</dd>
+    <dt>Trie Cache</dt><dd>Distributed in-memory copy of the trie, refreshed from a weekly snapshot of the Trie DB.</dd>
+    <dt>AJAX</dt><dd>Fetching data in the background without reloading the whole page.</dd>
+    <dt>Cache-Control</dt><dd>HTTP header telling caches who may store a response (<code>private</code>) and for how long (<code>max-age</code>).</dd>
+    <dt>Data sampling</dt><dd>Logging only 1 in N requests to save processing and storage.</dd>
+    <dt>Shard map manager</dt><dd>A lookup service/database that says which shard holds a given key or prefix.</dd>
+    <dt>Stream processing</dt><dd>Processing data continuously as it arrives, instead of in periodic batches.</dd>
+  </dl>
+  <details class="more refs"><summary>Book references (go deeper)</summary><div><ol>
+    <li><a href="https://www.facebook.com/notes/facebook-engineering/the-life-of-a-typeahead-query/389105248919/">The Life of a Typeahead Query</a></li>
+    <li><a href="https://medium.com/@prefixyteam/how-we-built-prefixy-a-scalable-prefix-search-service-for-powering-autocomplete-c20f98e2eff1">How We Built Prefixy: A Scalable Prefix Search Service for Powering Autocomplete</a></li>
+    <li><a href="https://people.eecs.berkeley.edu/~sylvia/papers/pht.pdf">Prefix Hash Tree: An Indexing Data Structure over Distributed Hash Tables</a></li>
+    <li><a href="https://en.wikipedia.org/wiki/MongoDB">MongoDB (Wikipedia)</a></li>
+    <li><a href="https://www.unicode.org/faq/basic_q.html">Unicode frequently asked questions</a></li>
+    <li><a href="https://hadoop.apache.org/">Apache Hadoop</a></li>
+    <li><a href="https://spark.apache.org/streaming/">Spark Streaming</a></li>
+    <li><a href="https://storm.apache.org/">Apache Storm</a></li>
+    <li><a href="https://kafka.apache.org/documentation/">Apache Kafka</a></li>
+  </ol></div></details>
+</section>
+
+</main>
+<script>
+(function () {
+  var K = 5, root = mk();
+  var DATA = { "tree": 10, "try": 29, "true": 35, "toy": 14, "wish": 25, "win": 50,
+               "be": 15, "bee": 20, "beer": 10, "best": 35, "bet": 29, "buy": 14 };
+  var $ = function (id) { return document.getElementById(id); };
+  function mk() { return { kids: {}, freq: 0, top: [] }; }
+  function cmp(a, b) { return b.f - a.f || (a.w < b.w ? -1 : 1); }
+  function insert(w) {
+    var n = root, path = [root];
+    for (var i = 0; i < w.length; i++) { n = n.kids[w[i]] || (n.kids[w[i]] = mk()); path.push(n); }
+    return path;
+  }
+  // A node's top k = best of its own query plus each child's cached top k.
+  function recompute(n, prefix) {
+    var c = n.freq ? [{ w: prefix, f: n.freq }] : [];
+    for (var ch in n.kids) c = c.concat(n.kids[ch].top);
+    n.top = c.sort(cmp).slice(0, K);
+  }
+  function fill(n, prefix) { for (var ch in n.kids) fill(n.kids[ch], prefix + ch); recompute(n, prefix); }
+  function find(p) { var n = root; for (var i = 0; i < p.length && n; i++) n = n.kids[p[i]]; return n || null; }
+  function scan(n, acc) { acc.nodes++; if (n.freq) acc.words++; for (var ch in n.kids) scan(n.kids[ch], acc); return acc; }
+  function record(w) {
+    var path = insert(w), changed = 0, leaf = path[path.length - 1];
+    leaf.freq++;
+    for (var i = path.length - 1; i >= 0; i--) {
+      var before = JSON.stringify(path[i].top);
+      recompute(path[i], w.slice(0, i));
+      if (JSON.stringify(path[i].top) !== before) changed++;
+    }
+    return { touched: path.length, changed: changed, freq: leaf.freq };
+  }
+  function fmt(list, k) { return list.slice(0, k).map(function (x) { return x.w + ": " + x.f; }).join(", "); }
+  function line(label, n, depth, prefix, target) {
+    var onPath = target.indexOf(prefix) === 0, inSub = !onPath && prefix.indexOf(target) === 0;
+    var color = onPath ? "var(--accent)" : inSub ? "var(--note)" : "var(--ink-3)";
+    return "<div style='padding-left:" + (depth * 1.5) + "ch;color:" + color + (onPath ? ";font-weight:700" : "") + "'>" +
+      label + (n.freq ? ": " + n.freq : "") + (prefix === target ? " ◀" : "") + "</div>";
+  }
+  function walk(n, prefix, depth, target, out) {
+    out.push(line(prefix, n, depth, prefix, target));
+    Object.keys(n.kids).sort().forEach(function (ch) { walk(n.kids[ch], prefix + ch, depth + 1, target, out); });
+    return out;
+  }
+  function render(target) {
+    var cols = Object.keys(root.kids).sort().map(function (ch) {
+      return "<div>" + walk(root.kids[ch], ch, 0, target, []).join("") + "</div>";
+    });
+    $("ac-tree").innerHTML = "<div style='width:100%'>" + line("(root)", root, 0, "", target) + "</div>" + cols.join("");
+  }
+  function show() {
+    var p = $("ac-in").value.toLowerCase().replace(/[^a-z]/g, "").slice(0, 50);
+    if ($("ac-in").value !== p) $("ac-in").value = p;
+    var k = +$("ac-k").value, n = find(p), o = $("ac-out");
+    $("ac-rec").disabled = !p;
+    render(p);
+    if (!n) { o.innerHTML = "No node for “" + p + "”, so no suggestions."; return; }
+    var s = scan(n, { nodes: 0, words: 0 });
+    o.innerHTML = "Top " + k + " for “" + p + "”: <b>[" + fmt(n.top, k) + "]</b>" +
+      (k < n.top.length ? "<br>Cached at this node (up to " + K + "): [" + fmt(n.top, K) + "]" : "") +
+      "<br><span style='color:var(--ink-3)'>With cache: walk " + p.length + " edge(s), read 1 list → O(1)" +
+      "<br>Without: visit " + s.nodes + " subtree node(s), sort " + s.words + " quer" + (s.words === 1 ? "y" : "ies") +
+      " → O(p + c + c log c)</span>";
+  }
+  for (var w in DATA) insert(w)[w.length].freq = DATA[w];
+  fill(root, "");
+  $("ac-in").oninput = show;
+  $("ac-k").onchange = show;
+  $("ac-rec").onclick = function () {
+    var p = $("ac-in").value;
+    if (!p) return;
+    var r = record(p);
+    show();
+    $("ac-out").innerHTML += "<br>Recorded “" + p + "” (now " + r.freq + "). Recomputed the cached list on " + r.touched +
+      " nodes (the node and every ancestor up to the root); " + r.changed + " changed.";
+  };
+  show();
+})();
+</script>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

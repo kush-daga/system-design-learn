@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 5 · Design Consistent Hashing — SDI Fast Track</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem("sdi:theme");if(t)document.documentElement.dataset.theme=JSON.parse(t)}catch(e){}</script>
+</head>
+<body data-root=".." data-chapter="5">
+<main id="content" class="chapter">
+
+<header class="chapter-hero">
+  <p class="eyebrow">Chapter 5 · Building block</p>
+  <h1>Design Consistent Hashing</h1>
+  <p class="lede">Why <code>hash(key) % N</code> reshuffles almost every key when a server joins or leaves, how a hash ring limits the damage to one slice, and how virtual nodes keep the load even.</p>
+  <div class="meta-row"></div>
+  <ul class="pace">
+    <li><a href="#tldr">⚡ TL;DR <small>2 min</small></a></li>
+    <li><a href="#skeleton">🗣 Interview answer <small>2 min</small></a></li>
+    <li><a href="#rehashing-problem">📖 Full walkthrough</a></li>
+    <li><a href="#self-test">🧠 Self-test</a></li>
+  </ul>
+</header>
+
+<section id="tldr" class="tldr">
+  <h2>TL;DR</h2>
+  <ul>
+    <li><b>Problem:</b> with <code>serverIndex = hash(key) % N</code>, adding or removing one server <b>remaps most keys</b>, causing a storm of cache misses.</li>
+    <li><b>Consistent hashing:</b> on a resize only <b>k/n keys move on average</b> (k keys, n slots), not nearly all.</li>
+    <li><b>Hash ring:</b> the hash space (SHA-1: 0 to 2<sup>160</sup> − 1) with its ends joined. Servers (by IP or name) and keys are hashed onto it with the same function, no modulo.</li>
+    <li><b>Lookup:</b> from the key, go <b>clockwise</b> to the first server.</li>
+    <li><b>Add/remove a server:</b> only keys between that node and the previous server (anticlockwise) move.</li>
+    <li><b>Basic ring's two flaws:</b> unequal partitions, and keys piling up on one server.</li>
+    <li><b>Fix: virtual nodes</b>, many ring points per server. 100 per server → standard deviation ≈ 10% of the mean; 200 → ≈ 5%. Cost: more metadata.</li>
+    <li><b>Used by:</b> Dynamo, Cassandra, Discord, Akamai CDN, Maglev.</li>
+  </ul>
+  <figure class="fig medium">
+    <img src="../assets/img/p-077-059.jpg" alt="Hash ring with four servers s0 to s3 and four keys k0 to k3; arrows go clockwise from each key to the next server">
+    <figcaption><b>Figure 5-7</b> · The whole idea: each key walks clockwise to the next server.</figcaption>
+  </figure>
+</section>
+
+<section id="skeleton">
+  <h2>How to use this in an interview</h2>
+  <p class="one-liner">Bring it up whenever data or requests must be spread across servers that come and go: sharded caches, key-value stores, partitioned databases, load balancers.</p>
+  <ol class="framework">
+    <li><b>Name the problem</b> "With <code>hash % N</code>, changing N remaps most keys, so caches miss everywhere at once."</li>
+    <li><b>Draw the ring</b> Hash space 0 to 2<sup>160</sup> − 1 bent into a circle. Place servers and keys on it with the same hash function.</li>
+    <li><b>Explain lookup and changes</b> A key belongs to the first server clockwise. Adding or removing a server moves only the keys in one range: about k/n of them.</li>
+    <li><b>Fix the flaws with virtual nodes</b> One point per server gives uneven partitions and skewed keys. Give each server 100–200 virtual nodes (σ drops from ~10% to ~5% of the mean), at the cost of more metadata.</li>
+    <li><b>Close with proof it works</b> Dynamo, Cassandra, Discord, Akamai and Maglev all use it.</li>
+  </ol>
+</section>
+
+<section id="rehashing-problem">
+  <h2>The rehashing problem</h2>
+  <p class="one-liner"><code>hash(key) % N</code> spreads keys evenly, but <b>changing N moves almost every key</b>.</p>
+  <p>A common way to balance load across N cache servers is <code>serverIndex = hash(key) % N</code>, where N is the size of the server pool. It works while the pool is fixed and data is evenly spread. In the book's example (4 servers, 8 keys), <code>hash(key0) % 4 = 1</code>, so clients fetch key0 from server 1.</p>
+  <p>Now <b>server 1 goes offline</b> and N becomes 3. Hashes don't change, but <code>hash % 3</code> gives new indexes, which map to server 0, server 2 and server 3.</p>
+  <table>
+    <tr><th>Key</th><th>hash</th><th>hash % 4 → server</th><th>hash % 3 → server</th><th>Moved?</th></tr>
+    <tr><td>key0</td><td>18358617</td><td>1 → server 1</td><td>0 → server 0</td><td>Yes (server 1 is gone)</td></tr>
+    <tr><td>key1</td><td>26143584</td><td>0 → server 0</td><td>0 → server 0</td><td>No</td></tr>
+    <tr><td>key2</td><td>18131146</td><td>2 → server 2</td><td>1 → server 2</td><td>No</td></tr>
+    <tr><td>key3</td><td>35863496</td><td>0 → server 0</td><td>2 → server 3</td><td class="no">Yes, needlessly</td></tr>
+    <tr><td>key4</td><td>34085809</td><td>1 → server 1</td><td>1 → server 2</td><td>Yes (server 1 is gone)</td></tr>
+    <tr><td>key5</td><td>27581703</td><td>3 → server 3</td><td>0 → server 0</td><td class="no">Yes, needlessly</td></tr>
+    <tr><td>key6</td><td>38164978</td><td>2 → server 2</td><td>1 → server 2</td><td>No</td></tr>
+    <tr><td>key7</td><td>22530351</td><td>3 → server 3</td><td>0 → server 0</td><td class="no">Yes, needlessly</td></tr>
+  </table>
+  <p><b>5 of 8 keys move</b>, though only key0 and key4 lived on server 1. Most cache clients now ask the wrong server: a <b>storm of cache misses</b>.</p>
+  <div class="fig-row">
+    <figure class="fig">
+      <img src="../assets/img/p-073-052.jpg" alt="With hash % 4: server 0 holds key1 and key3, server 1 holds key0 and key4, server 2 holds key2 and key6, server 3 holds key5 and key7">
+      <figcaption><b>Figure 5-1</b> · Before: two keys per server.</figcaption>
+    </figure>
+    <figure class="fig">
+      <img src="../assets/img/p-074-054.jpg" alt="With hash % 3 after server 1 goes offline: moved keys key0, key3, key4, key5, key7 shown in red">
+      <figcaption><b>Figure 5-2</b> · After: red keys moved, three of them needlessly.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section id="consistent-hashing">
+  <h2>How consistent hashing works</h2>
+  <p class="one-liner">Put servers and keys on the same ring. <b>Each key belongs to the next server clockwise.</b></p>
+  <h3>Definition</h3>
+  <aside class="callout key">
+    <span class="callout-label">Key idea</span>
+    <p>With <b>consistent hashing</b>, resizing the hash table remaps only <b>k/n keys on average</b> (k keys, n slots). A traditional hash table remaps nearly all of them. With 1 million keys and 10 servers, that's about 100,000 keys instead of nearly 1 million.</p>
+  </aside>
+
+  <h3>Hash space and hash ring</h3>
+  <p>Use <b>SHA-1</b> as the hash function f. Its output range, the <b>hash space</b>, runs from x0 = 0 to xn = 2<sup>160</sup> − 1. <b>Join the two ends of that range and you get a hash ring.</b></p>
+  <figure class="fig small">
+    <img src="../assets/img/p-075-056.jpg" alt="A circle where the last hash value xn sits right next to the first value x0">
+    <figcaption><b>Figure 5-4</b> · xn (2<sup>160</sup> − 1) wraps around to x0 (0).</figcaption>
+  </figure>
+
+  <h3>Hash servers</h3>
+  <p>Using the same f, place each server on the ring by hashing its <b>IP address or name</b> (the example has s0 to s3).</p>
+
+  <h3>Hash keys</h3>
+  <p>Hash the keys (key0 to key3) onto the same ring. This is a different hash function from the rehashing example, and there is <b>no modulo</b>.</p>
+
+  <h3>Server lookup</h3>
+  <p>From the key's position, <b>go clockwise until you reach a server</b>: key0 → server 0, key1 → server 1, key2 → server 2, key3 → server 3.</p>
+  <figure class="fig medium">
+    <img src="../assets/img/p-077-059.jpg" alt="Four servers and four keys on the ring, each key with an arrow clockwise to the next server">
+    <figcaption><b>Figure 5-7</b> · Each arrow runs clockwise from a key to the first server it meets.</figcaption>
+  </figure>
+</section>
+
+<section id="add-remove">
+  <h2>Adding and removing a server</h2>
+  <p class="one-liner">A change to the pool <b>only moves the keys in one slice of the ring</b>.</p>
+  <h3>Add a server</h3>
+  <p>Server 4 lands between key0 and server 0. Clockwise from key0, the first server is now s4, so <b>only key0 moves</b> (server 0 → server 4). key1, key2 and key3 stay put.</p>
+  <figure class="fig medium">
+    <img src="../assets/img/p-078-060.jpg" alt="New server s4 placed between k0 and s0; k0's old path to s0 is crossed out and it now stops at s4">
+    <figcaption><b>Figure 5-8</b> · key0's old path to s0 is crossed out; it now stops at s4.</figcaption>
+  </figure>
+  <h3>Remove a server</h3>
+  <p>Remove server 1 and <b>only key1 is remapped</b>, to server 2 (the next server clockwise).</p>
+  <figure class="fig medium">
+    <img src="../assets/img/p-079-061.jpg" alt="Server s1 crossed out; an arrow carries k1 past s1 to s2">
+    <figcaption><b>Figure 5-9</b> · With s1 gone, k1 keeps walking clockwise to s2.</figcaption>
+  </figure>
+</section>
+
+<section id="two-problems">
+  <h2>Two problems with the basic approach</h2>
+  <p class="one-liner">One point per server leaves <b>partitions uneven</b> and lets <b>keys pile up</b> on one server.</p>
+  <p>The basic algorithm, introduced by Karger et al. at MIT, has two steps:</p>
+  <ol>
+    <li>Map servers and keys onto the ring with a uniformly distributed hash function.</li>
+    <li>Go clockwise from the key's position to the first server.</li>
+  </ol>
+  <h3>Problem 1 · Partitions can't stay the same size</h3>
+  <p>A <b>partition</b> is the hash space between adjacent servers. As servers are added and removed, some partitions become very small and others fairly large. In Figure 5-10, removing s1 makes s2's partition <b>twice as large</b> as those of s0 and s3.</p>
+  <figure class="fig medium">
+    <img src="../assets/img/p-080-062.jpg" alt="Ring with s1 crossed out; a pink arrow from s0 to s2 marks s2's enlarged partition">
+    <figcaption><b>Figure 5-10</b> · The pink arrow is s2's partition after s1 leaves.</figcaption>
+  </figure>
+  <h3>Problem 2 · Keys can be unevenly distributed</h3>
+  <p>In Figure 5-11 the servers sit close together, so <b>most keys are stored on server 2</b>, while server 1 and server 3 hold no data.</p>
+  <figure class="fig medium">
+    <img src="../assets/img/p-080-063.jpg" alt="Servers bunched in the top half of the ring, most keys in the bottom-left half, all mapping clockwise to s2">
+    <figcaption><b>Figure 5-11</b> · Four of the five keys walk clockwise to s2.</figcaption>
+  </figure>
+  <p>The fix for both: <b>virtual nodes</b> (also called replicas).</p>
+</section>
+
+<section id="virtual-nodes">
+  <h2>Virtual nodes</h2>
+  <p class="one-liner">Represent each server by <b>many points on the ring</b>, so it owns many small partitions instead of one big one.</p>
+  <p>A <b>virtual node</b> refers to a real node, and each server appears on the ring several times. In Figure 5-12, server 0 is s0_0, s0_1, s0_2 and server 1 is s1_0, s1_1, s1_2. Three is arbitrary; real systems use far more. Each server now manages several partitions.</p>
+  <figure class="fig medium">
+    <img src="../assets/img/p-081-064.jpg" alt="Ring with six virtual nodes alternating between server 0 and server 1, each arc labelled with the server that owns it">
+    <figcaption><b>Figure 5-12</b> · Arcs labelled s0 belong to server 0, arcs labelled s1 to server 1.</figcaption>
+  </figure>
+  <p>Lookup: go clockwise to the <b>first virtual node</b> and map it to its server. In Figure 5-13, k0 reaches s1_1, so it is stored on server 1.</p>
+  <figure class="fig medium">
+    <img src="../assets/img/p-082-065.jpg" alt="Key k0 between s0_0 and s1_1; arrow clockwise to s1_1">
+    <figcaption><b>Figure 5-13</b> · k0 stops at s1_1, which means server 1.</figcaption>
+  </figure>
+
+  <h3>How many virtual nodes?</h3>
+  <p>More virtual nodes → smaller <b>standard deviation</b> (how spread out the data is) → more balanced load. An online experiment measured:</p>
+  <div class="stats">
+    <div class="stat"><b>100 vnodes</b><span>standard deviation ≈ 10% of the mean</span></div>
+    <div class="stat"><b>200 vnodes</b><span>standard deviation ≈ 5% of the mean</span></div>
+  </div>
+  <aside class="callout warn">
+    <span class="callout-label">Trade-off</span>
+    <p>More virtual nodes need more space to store virtual-node data. Tune the number to the system's requirements.</p>
+  </aside>
+  <aside class="callout note">
+    <span class="callout-label">Beyond the book</span>
+    <p><b>Lookup cost:</b> keep virtual-node positions sorted and binary-search for the first one ≥ hash(key), wrapping to the start: O(log n). <b>Uneven hardware:</b> give bigger servers more virtual nodes (Dynamo does this).</p>
+  </aside>
+</section>
+
+<section id="affected-keys">
+  <h2>Finding affected keys</h2>
+  <p class="one-liner">From the changed node, <b>walk anticlockwise to the previous server</b>. That range is the only data that moves.</p>
+  <p>Using the rings from Figures 5-8 and 5-9:</p>
+  <table>
+    <tr><th>Event</th><th>Affected range</th><th>Keys in that range move to</th></tr>
+    <tr><td><b>Add</b> server 4</td><td>From s4 (the new node) anticlockwise to the first server found, s3</td><td>s4</td></tr>
+    <tr><td><b>Remove</b> server 1</td><td>From s1 (the removed node) anticlockwise to the first server found, s0</td><td>s2, the next server clockwise</td></tr>
+  </table>
+
+  <div class="demo" id="ring-demo">
+    <span class="demo-title">Try it · Hash ring</span>
+    <p style="font-size:15px;margin-bottom:10px">100 keys (dots) and your servers share one ring. Each arc is colored by the server that owns it, and each key takes the color of the first server clockwise. Add or remove a server: the keys that move are enlarged and outlined. Then raise the virtual nodes and watch the shares even out. With the starting 4 servers, σ falls from about 70% of the mean (one point each) to about 11% at 100 and 5% at 200 virtual nodes, close to the book's numbers.</p>
+    <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px">
+      <button class="btn primary" id="hr-add" type="button">+ Add server</button>
+      <select id="hr-pick" aria-label="Server to remove"></select>
+      <button class="btn" id="hr-del" type="button">Remove</button>
+      <label>Virtual nodes per server <select id="hr-v"><option>1</option><option>3</option><option>10</option><option>100</option><option>200</option></select></label>
+    </div>
+    <svg id="hr-svg" viewBox="0 0 320 320" style="display:block;width:100%;max-width:340px;margin:0 auto" role="img" aria-label="Hash ring with servers and keys"></svg>
+    <div class="out" id="hr-out" style="line-height:1.8;margin-top:10px"></div>
+  </div>
+</section>
+
+<section id="wrap-up">
+  <h2>Wrap up</h2>
+  <p class="one-liner">Consistent hashing <b>minimizes data movement</b> and <b>evens out load</b>, which is why so many large systems use it.</p>
+  <h3>Benefits</h3>
+  <ul>
+    <li><b>Minimal redistribution:</b> few keys move when servers are added or removed.</li>
+    <li><b>Easy horizontal scaling:</b> data is spread more evenly across servers.</li>
+    <li><b>Mitigates the hotspot key problem:</b> heavy traffic to one shard can overload its server (imagine Katy Perry, Justin Bieber and Lady Gaga all on one shard). More even distribution makes that less likely.</li>
+  </ul>
+  <h3>Used in real systems</h3>
+  <table>
+    <tr><th>System</th><th>Where consistent hashing is used</th></tr>
+    <tr><td>Amazon Dynamo</td><td>The database's partitioning component</td></tr>
+    <tr><td>Apache Cassandra</td><td>Data partitioning across the cluster</td></tr>
+    <tr><td>Discord</td><td>The chat application</td></tr>
+    <tr><td>Akamai</td><td>Content delivery network</td></tr>
+    <tr><td>Maglev</td><td>Google's network load balancer</td></tr>
+  </table>
+  <aside class="callout note">
+    <span class="callout-label">Beyond the book</span>
+    <p>Consistent hashing spreads <i>many</i> keys evenly but can't split <i>one</i>. A single hot key still lives on one server; the usual fix is to replicate or cache that key.</p>
+  </aside>
+</section>
+
+<section id="self-test">
+  <h2>Self-test</h2>
+  <details class="qa"><summary>Why does <code>serverIndex = hash(key) % N</code> break when a server is added or removed?</summary><div><p>N changes, so <code>hash % N</code> gives a different index for most keys, not just those on the changed server. Clients go to the wrong servers and you get a storm of cache misses.</p></div></details>
+  <details class="qa"><summary>In the book's example (8 keys, 4 servers, server 1 goes offline), how many keys move, and how many had to?</summary><div><p>5 of 8 move (key0, key3, key4, key5, key7). Only key0 and key4 were on server 1; the other three moved needlessly.</p></div></details>
+  <details class="qa"><summary>By the definition, how many keys are remapped on average when a consistent-hashing table is resized?</summary><div><p><b>k/n</b>, where k is the number of keys and n the number of slots. A traditional hash table remaps nearly all keys.</p></div></details>
+  <details class="qa"><summary>What is the hash space if you use SHA-1, and how do you get the ring?</summary><div><p>0 to 2<sup>160</sup> − 1. Join the two ends of that range so the last value wraps around to the first.</p></div></details>
+  <details class="qa"><summary>How are servers and keys placed on the ring, and how do you find a key's server?</summary><div><p>Hash servers (by IP or name) and keys with the same function, with no modulo. From the key's position, go clockwise to the first server.</p></div></details>
+  <details class="qa"><summary>Server 4 is added between key0 and server 0. Which keys move?</summary><div><p>Only key0, which moves from server 0 to server 4. In general, only keys between the new node and the previous server anticlockwise move, and all of them go to the new node.</p></div></details>
+  <details class="qa"><summary>Server 1 is removed. Where do its keys go?</summary><div><p>To the next server clockwise (server 2). The affected range runs from s1 anticlockwise to s0. Nothing else moves.</p></div></details>
+  <details class="qa"><summary>What are the two problems with the basic (one point per server) ring?</summary><div><ul><li>Partitions can't stay equal as servers come and go (removing s1 makes s2's partition twice as large as s0's and s3's).</li><li>Keys can be unevenly distributed (most keys on server 2, none on servers 1 and 3).</li></ul></div></details>
+  <details class="qa"><summary>What is a virtual node, and how does lookup work with them?</summary><div><p>One of many points on the ring that stand for a real server (s0_0, s0_1, s0_2 for server 0). Go clockwise to the first virtual node and map it to its server.</p></div></details>
+  <details class="qa"><summary>What standard deviation do 100 and 200 virtual nodes give, and what is the cost?</summary><div><p>About 10% of the mean with 100 and about 5% with 200. More virtual nodes need more space to store their metadata, so tune the number to the system's needs.</p></div></details>
+  <details class="qa"><summary>Name three benefits of consistent hashing.</summary><div><p>Few keys move when servers change, horizontal scaling is easy because data is spread evenly, and it mitigates hotspot shards (several celebrities' data on one shard).</p></div></details>
+  <details class="qa"><summary>Name real systems that use consistent hashing.</summary><div><p>Amazon Dynamo (partitioning), Apache Cassandra (data partitioning), Discord, the Akamai CDN, and Google's Maglev load balancer.</p></div></details>
+</section>
+
+<section id="glossary">
+  <h2>Terms to know</h2>
+  <dl class="glossary">
+    <dt>Rehashing problem</dt><dd>With <code>hash % N</code>, changing N remaps most keys to different servers.</dd>
+    <dt>Consistent hashing</dt><dd>Hashing in which resizing remaps only about k/n keys on average.</dd>
+    <dt>Hash space</dt><dd>The output range of the hash function: 0 to 2<sup>160</sup> − 1 for SHA-1.</dd>
+    <dt>Hash ring</dt><dd>The hash space with its two ends joined, so positions wrap around.</dd>
+    <dt>Partition</dt><dd>The hash space between two adjacent servers on the ring.</dd>
+    <dt>Virtual node</dt><dd>One of many ring positions that stand for the same real server (also called a replica).</dd>
+    <dt>Standard deviation</dt><dd>How spread out the data is. Lower means a more even load across servers.</dd>
+    <dt>Hotspot</dt><dd>A shard that gets so much traffic its server is overloaded.</dd>
+  </dl>
+  <details class="more refs"><summary>Book references (go deeper)</summary><div><ol>
+    <li><a href="https://en.wikipedia.org/wiki/Consistent_hashing">Consistent hashing (Wikipedia)</a></li>
+    <li><a href="https://tom-e-white.com/2007/11/consistent-hashing.html">Consistent Hashing (Tom White)</a></li>
+    <li><a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo: Amazon's Highly Available Key-value Store</a></li>
+    <li><a href="http://www.cs.cornell.edu/Projects/ladis2009/papers/Lakshman-ladis2009.PDF">Cassandra: A Decentralized Structured Storage System</a></li>
+    <li><a href="https://blog.discord.com/scaling-elixir-f9b8e1e7c29b">How Discord Scaled Elixir to 5,000,000 Concurrent Users</a></li>
+    <li><a href="http://theory.stanford.edu/~tim/s16/l/l1.pdf">CS168: The Modern Algorithmic Toolbox, Lecture #1: Introduction and Consistent Hashing</a></li>
+    <li><a href="https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/44824.pdf">Maglev: A Fast and Reliable Software Network Load Balancer</a></li>
+  </ol></div></details>
+</section>
+
+</main>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var COLORS = ["var(--key)", "var(--tip)", "var(--note)", "var(--warn)", "color-mix(in srgb,var(--key) 50%,var(--warn))",
+    "color-mix(in srgb,var(--note) 50%,var(--key))", "color-mix(in srgb,var(--tip) 50%,var(--warn))", "var(--ink-3)"];
+  var NKEYS = 100, FULL = 4294967296, V = 1, servers = [0, 1, 2, 3], keys = [], i;
+  function h32(s) { // FNV-1a with a final bit mix: string -> 0 .. 2^32-1
+    var h = 2166136261;
+    for (var j = 0; j < s.length; j++) { h ^= s.charCodeAt(j); h = Math.imul(h, 16777619); }
+    h ^= h >>> 16; h = Math.imul(h, 2246822507); h ^= h >>> 13; h = Math.imul(h, 3266489909); h ^= h >>> 16;
+    return h >>> 0;
+  }
+  for (i = 0; i < NKEYS; i++) keys.push(h32("key" + i));
+  function build(list) { // sorted virtual nodes {p: position, s: server}
+    var nodes = [];
+    list.forEach(function (s) { for (var j = 0; j < V; j++) nodes.push({ p: h32("cache" + s + "#" + j), s: s }); });
+    return nodes.sort(function (a, b) { return a.p - b.p; });
+  }
+  function owner(nodes, p) { // first node clockwise from p (binary search, wrap to the start)
+    var lo = 0, hi = nodes.length;
+    while (lo < hi) { var m = (lo + hi) >> 1; if (nodes[m].p < p) lo = m + 1; else hi = m; }
+    return nodes[lo % nodes.length].s;
+  }
+  function assign(list) { var n = build(list); return keys.map(function (k) { return owner(n, k); }); }
+  function modAssign(list) { return keys.map(function (k) { return list[k % list.length]; }); }
+  function xy(p, r) { var a = p / FULL * 2 * Math.PI - Math.PI / 2; return [(160 + r * Math.cos(a)).toFixed(1), (160 + r * Math.sin(a)).toFixed(1)]; }
+  function names(set) { return Object.keys(set).map(function (s) { return "s" + s; }).join(", "); }
+  function render(msg, moved) {
+    var nodes = build(servers), own = assign(servers), svg = "", share = {}, cnt = {}, R = 128;
+    servers.forEach(function (s) { share[s] = 0; cnt[s] = 0; });
+    own.forEach(function (s) { cnt[s]++; });
+    nodes.forEach(function (n, j) {
+      var from = j ? nodes[j - 1].p : nodes[nodes.length - 1].p - FULL, len = n.p - from, a = xy(from, R), b = xy(n.p, R);
+      share[n.s] += len / FULL;
+      var st = ' style="fill:none;stroke:' + COLORS[n.s] + ';stroke-width:8"';
+      svg += nodes.length === 1 ? '<circle cx="160" cy="160" r="' + R + '"' + st + "/>" :
+        '<path d="M' + a[0] + " " + a[1] + "A" + R + " " + R + " 0 " + (len > FULL / 2 ? 1 : 0) + " 1 " + b[0] + " " + b[1] + '"' + st + "/>";
+    });
+    if (V <= 10) nodes.forEach(function (n) {
+      var c = xy(n.p, R), t = xy(n.p, R + 17);
+      svg += '<circle cx="' + c[0] + '" cy="' + c[1] + '" r="' + (V === 1 ? 7 : 5) + '" style="fill:' + COLORS[n.s] + ';stroke:var(--surface);stroke-width:2"/>';
+      if (V === 1) svg += '<text x="' + t[0] + '" y="' + t[1] + '" text-anchor="middle" dominant-baseline="middle" style="fill:var(--ink-2);font:600 12px var(--sans)">s' + n.s + "</text>";
+    });
+    keys.forEach(function (k, j) {
+      var c = xy(k, R - 18), mv = moved && moved[j];
+      svg += '<circle cx="' + c[0] + '" cy="' + c[1] + '" r="' + (mv ? 5 : 2.6) + '" style="fill:' + COLORS[own[j]] + (mv ? ";stroke:var(--ink);stroke-width:1.5" : "") + '"/>';
+    });
+    $("hr-svg").innerHTML = svg;
+    var mean = 1 / servers.length, varc = 0;
+    servers.forEach(function (s) { varc += Math.pow(share[s] - mean, 2) / servers.length; });
+    $("hr-out").innerHTML = msg + "<br>" + servers.map(function (s) {
+      return '<span style="color:' + COLORS[s] + '">●</span> s' + s + " " + (share[s] * 100).toFixed(1) + "% of ring · " + cnt[s] + " keys";
+    }).join("<br>") + (servers.length > 1 ? "<br>Spread of ring shares: σ = <b>" + (Math.sqrt(varc) / mean * 100).toFixed(1) + "%</b> of the mean" : "");
+    $("hr-pick").innerHTML = servers.map(function (s) { return '<option value="' + s + '">s' + s + "</option>"; }).join("");
+  }
+  function change(list, added, s) {
+    var before = assign(servers), mb = modAssign(servers);
+    servers = list;
+    var after = assign(servers), ma = modAssign(servers), moved = [], n = 0, modN = 0, other = {};
+    before.forEach(function (o, j) {
+      moved.push(o !== after[j]);
+      if (o !== after[j]) { n++; other[added ? o : after[j]] = 1; }
+      if (mb[j] !== ma[j]) modN++;
+    });
+    render((added ? "Added" : "Removed") + " s" + s + ": <mark>" + n + " of " + NKEYS + " keys moved</mark>" +
+      (n ? (added ? ", all to s" + s + ", taken from " : ", exactly the keys s" + s + " held, now on ") + names(other) : "") +
+      ". With <code>hash % N</code>, " + modN + " would have moved.", moved);
+  }
+  $("hr-add").onclick = function () {
+    for (var s = 0; s < 8 && servers.indexOf(s) >= 0; s++);
+    if (s === 8) return render("This demo stops at 8 servers.", null);
+    change(servers.concat([s]).sort(function (a, b) { return a - b; }), true, s);
+  };
+  $("hr-del").onclick = function () {
+    var s = parseInt($("hr-pick").value, 10);
+    if (servers.length < 2) return render("Keep at least one server.", null);
+    change(servers.filter(function (x) { return x !== s; }), false, s);
+  };
+  $("hr-v").onchange = function () {
+    V = parseInt($("hr-v").value, 10);
+    render(V + " virtual node" + (V > 1 ? "s" : "") + " per server. Every position was re-hashed, so now add or remove a server to count moves.", null);
+  };
+  render("4 servers, one point each. Add or remove a server to see which keys move.", null);
+})();
+</script>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

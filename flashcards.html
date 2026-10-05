@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flashcards — SDI Fast Track</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=localStorage.getItem("sdi:theme");if(t)document.documentElement.dataset.theme=JSON.parse(t)}catch(e){}</script>
+</head>
+<body data-root=".">
+<main class="page">
+  <header class="chapter-hero">
+    <p class="eyebrow">Active recall</p>
+    <h1>Flashcards</h1>
+    <p class="lede">Every self-test question from every chapter. Say the answer out loud, flip the card, and grade yourself honestly. Cards you miss come back sooner; cards you know move to the back.</p>
+  </header>
+
+  <div class="fc-controls">
+    <select id="fc-ch" aria-label="Chapter"></select>
+    <button class="btn" id="fc-shuffle" type="button">Shuffle</button>
+    <button class="btn" id="fc-reset" type="button" title="Forget all grades">Reset grades</button>
+    <span class="fc-stats" id="fc-stats"></span>
+  </div>
+
+  <div class="fc-card" id="fc-card" tabindex="0" aria-live="polite">
+    <div class="fc-meta" id="fc-meta"></div>
+    <div class="fc-q" id="fc-q"></div>
+    <div class="fc-a" id="fc-a"></div>
+    <div class="fc-hint">Click or press <kbd>Space</kbd> to show the answer</div>
+  </div>
+  <div class="fc-buttons">
+    <button class="btn" id="fc-again" type="button">✗ Missed it <kbd>1</kbd></button>
+    <button class="btn primary" id="fc-good" type="button">✓ Knew it <kbd>2</kbd></button>
+    <a class="btn" id="fc-open" href="#">Open chapter</a>
+  </div>
+</main>
+<script src="assets/chapters.js"></script>
+<script src="assets/cards.js"></script>
+<script src="assets/app.js"></script>
+<script>
+(function () {
+  var CARDS = window.CARDS || [], CH = window.CHAPTERS || [], S = window.SDI.store;
+  var $ = function (id) { return document.getElementById(id); };
+  var byN = {}; CH.forEach(function (c) { byN[c.n] = c; });
+  function key(c) { var s = c.ch + "|" + c.q, h = 0; for (var i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; return "k" + h; }
+  var grades = S.get("cards", {});
+  function box(c) { return (grades[key(c)] || {}).box || 0; }
+
+  var sel = $("fc-ch");
+  var counts = {}; CARDS.forEach(function (c) { counts[c.ch] = (counts[c.ch] || 0) + 1; });
+  sel.innerHTML = '<option value="all">All chapters (' + CARDS.length + ")</option>" +
+    CH.filter(function (c) { return counts[c.n]; }).map(function (c) {
+      return '<option value="' + c.n + '">Ch ' + c.n + " · " + c.short + " (" + counts[c.n] + ")</option>";
+    }).join("");
+  var saved = S.get("fc-ch", "all");
+  if (sel.querySelector('option[value="' + saved + '"]')) sel.value = saved;
+
+  var queue = [], cur = null, flipped = false;
+  function shuffle(a) { for (var i = a.length - 1; i > 0; i--) { var j = Math.floor(Math.random() * (i + 1)); var t = a[i]; a[i] = a[j]; a[j] = t; } return a; }
+  function build() {
+    var pool = CARDS.filter(function (c) { return sel.value === "all" || String(c.ch) === sel.value; });
+    queue = shuffle(pool.slice()).sort(function (a, b) { return box(a) - box(b); });
+    next();
+  }
+  function stats() {
+    var pool = CARDS.filter(function (c) { return sel.value === "all" || String(c.ch) === sel.value; });
+    var known = pool.filter(function (c) { return box(c) > 0; }).length;
+    $("fc-stats").textContent = known + " / " + pool.length + " known · " + queue.length + " left this round";
+  }
+  function show() {
+    flipped = false;
+    $("fc-card").classList.remove("flipped");
+    if (!cur) {
+      $("fc-meta").textContent = "Round complete";
+      $("fc-q").textContent = "Nice. You've been through every card in this set.";
+      $("fc-a").innerHTML = "";
+      $("fc-open").style.display = "none";
+      stats();
+      return;
+    }
+    var c = byN[cur.ch] || { short: "" };
+    $("fc-meta").textContent = "Chapter " + cur.ch + " · " + c.short + (box(cur) ? " · known ×" + box(cur) : "");
+    $("fc-q").innerHTML = cur.q;
+    $("fc-a").innerHTML = cur.a;
+    $("fc-open").style.display = "";
+    $("fc-open").href = "chapters/" + c.slug + ".html#self-test";
+    stats();
+  }
+  function next() { cur = queue.shift() || null; show(); }
+  function flip() { if (!cur) { build(); return; } flipped = !flipped; $("fc-card").classList.toggle("flipped", flipped); }
+  function grade(ok) {
+    if (!cur) return;
+    if (!flipped) { flip(); return; }
+    var k = key(cur), g = grades[k] || { box: 0, seen: 0 };
+    g.seen++; g.box = ok ? Math.min(g.box + 1, 5) : 0;
+    grades[k] = g; S.set("cards", grades);
+    if (!ok) queue.splice(Math.min(3, queue.length), 0, cur);
+    next();
+  }
+  $("fc-card").onclick = function (e) { if (e.target.closest("a")) return; flip(); };
+  $("fc-again").onclick = function () { grade(false); };
+  $("fc-good").onclick = function () { grade(true); };
+  $("fc-shuffle").onclick = build;
+  $("fc-reset").onclick = function () { if (confirm("Forget all flashcard grades?")) { grades = {}; S.set("cards", grades); build(); } };
+  sel.onchange = function () { S.set("fc-ch", sel.value); build(); };
+  addEventListener("keydown", function (e) {
+    if (e.metaKey || e.ctrlKey || e.altKey || /input|select|textarea/i.test(e.target.tagName)) return;
+    if (e.key === " " || e.key === "Enter") { e.preventDefault(); flip(); }
+    else if (e.key === "1") grade(false);
+    else if (e.key === "2") grade(true);
+  });
+  build();
+})();
+</script>
+</body>
+</html>

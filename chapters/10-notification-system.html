@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 10 · Design a Notification System — SDI Fast Track</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem("sdi:theme");if(t)document.documentElement.dataset.theme=JSON.parse(t)}catch(e){}</script>
+</head>
+<body data-root=".." data-chapter="10">
+<main id="content" class="chapter">
+
+<header class="chapter-hero">
+  <p class="eyebrow">Chapter 10 · Design problem</p>
+  <h1>Design a Notification System</h1>
+  <p class="lede">How to send millions of push, SMS and email notifications a day: which third-party service delivers each channel, why you put one message queue per channel between your servers and those services, and how a notification log, dedupe, retries and rate limits keep notifications from being lost or turning into spam.</p>
+  <div class="meta-row"></div>
+  <ul class="pace">
+    <li><a href="#tldr">⚡ TL;DR <small>2 min</small></a></li>
+    <li><a href="#skeleton">🗣 Interview answer <small>3 min</small></a></li>
+    <li><a href="#step-1">📖 Full walkthrough</a></li>
+    <li><a href="#self-test">🧠 Self-test</a></li>
+  </ul>
+</header>
+
+<section id="tldr" class="tldr">
+  <h2>TL;DR</h2>
+  <ul>
+    <li><b>Scope:</b> push (iOS, Android), SMS and email. <b>Soft real-time</b>, opt-out supported, <b>10M push + 1M SMS + 5M email per day</b>.</li>
+    <li><b>Third parties deliver:</b> iOS → <b>APNs</b>, Android → <b>FCM</b>, SMS → <b>Twilio/Nexmo</b>, email → <b>Sendgrid/Mailchimp</b>. Collect device tokens, phone numbers and emails at install or sign-up.</li>
+    <li><b>Flow:</b> services → <b>notification servers</b> (auth, rate limit, validate, read user/device/settings from cache/DB) → <b>one message queue per channel</b> → <b>workers</b> → third party → device.</li>
+    <li>Queues decouple components and absorb spikes. One queue per channel means <b>one provider's outage doesn't block the other channels</b>.</li>
+    <li><b>Never lose a notification:</b> persist it in a <b>notification log</b>; on failure, put it back on the queue to retry, and alert developers if failures persist.</li>
+    <li><b>Exactly-once delivery is impossible.</b> Reduce duplicates by deduping on <b>event ID</b>.</li>
+    <li>Also: templates, per-channel opt-in settings, per-user rate limiting, <b>appKey/appSecret</b>, queue-depth monitoring, event tracking.</li>
+  </ul>
+  <figure class="fig">
+    <img src="../assets/img/p-163-136.jpg" alt="Final notification system: service, notification servers with authentication and rate limit, cache and DB, iOS PN queue with retry loop, workers using templates and a notification log, APNs, iOS device, and an analytics service">
+    <figcaption><b>Figure 10-14</b> · The final design, shown for the iOS channel. Note the retry loop back into the queue, the notification log, and the analytics events (pending, sent, click).</figcaption>
+  </figure>
+</section>
+
+<section id="skeleton">
+  <h2>Interview answer skeleton</h2>
+  <p class="one-liner">If asked this in an interview, walk through these four beats. Each maps to a section below.</p>
+  <ol class="framework">
+    <li><b>Clarify (≈5 min)</b> Ask which channels, how real-time, which devices, what triggers a notification, whether users can opt out, and daily volume (10M push, 1M SMS, 5M email).</li>
+    <li><b>High-level (≈15 min)</b> Name the provider for each channel and what it needs (device token, phone number, email). Show how contact info is collected. Draw the single-server design, name its three problems, then draw the improved design: notification servers, cache/DB, a queue per channel, workers.</li>
+    <li><b>Deep dive (≈15 min)</b> No data loss (notification log + retry). Dedupe by event ID, since exactly-once is impossible. Then templates, opt-in settings, rate limiting, retries, appKey/appSecret, queue monitoring, event tracking.</li>
+    <li><b>Wrap up (≈5 min)</b> Reliability, security, tracking and monitoring, respecting user settings, rate limiting.</li>
+  </ol>
+</section>
+
+<section id="step-1">
+  <h2><span class="step-num">Step 1</span>Understand the problem</h2>
+  <p class="one-liner">Pin down <b>channels, latency, devices, triggers and volume</b>. The question is deliberately open-ended.</p>
+  <p>A notification alerts a user to important information: breaking news, product updates, events, offers. It comes in three formats: <b>mobile push notification</b>, <b>SMS message</b> and <b>email</b>.</p>
+  <figure class="fig medium">
+    <img src="../assets/img/p-151-121.jpg" alt="Examples of a push notification on an iPhone lock screen, an SMS message, and a marketing email">
+    <figcaption><b>Figure 10-1</b> · The three formats you must support: push, SMS and email.</figcaption>
+  </figure>
+  <table class="qa-table">
+    <tr><th>You ask</th><th>Interviewer says</th></tr>
+    <tr><td>What types of notifications does the system support?</td><td>Push notification, SMS message, and email.</td></tr>
+    <tr><td>Is it a real-time system?</td><td><b>Soft real-time.</b> Users should get notifications as soon as possible, but a slight delay is acceptable under high workload.</td></tr>
+    <tr><td>What are the supported devices?</td><td>iOS devices, Android devices, and laptop/desktop.</td></tr>
+    <tr><td>What triggers notifications?</td><td>Client applications can trigger them. They can also be scheduled on the server side.</td></tr>
+    <tr><td>Will users be able to opt out?</td><td>Yes. Users who opt out no longer receive notifications.</td></tr>
+    <tr><td>How many notifications are sent each day?</td><td>10 million mobile push notifications, 1 million SMS messages, and 5 million emails.</td></tr>
+  </table>
+  <h4>Requirements</h4>
+  <ul class="checklist">
+    <li>Three channels: push notification, SMS, email</li>
+    <li>Soft real-time: deliver fast, tolerate slight delay at peak</li>
+    <li>Devices: iOS, Android, laptop/desktop</li>
+    <li>Triggered by client apps or scheduled on the server</li>
+    <li>Users can opt out</li>
+  </ul>
+  <div class="stats">
+    <div class="stat"><b>10M</b><span>push notifications / day</span></div>
+    <div class="stat"><b>1M</b><span>SMS messages / day</span></div>
+    <div class="stat"><b>5M</b><span>emails / day</span></div>
+    <div class="stat"><b>≈185/s</b><span>average total (16M ÷ 86,400 s; derived, not in the book)</span></div>
+  </div>
+</section>
+
+<section id="step-2">
+  <h2><span class="step-num">Step 2</span>High-level design</h2>
+  <p class="one-liner">Third-party services do the actual delivery. Your system <b>collects contact info</b> and <b>gets notification events to those services reliably and at scale</b>.</p>
+
+  <h3>Different types of notifications</h3>
+  <h4>iOS push notification</h4>
+  <p>Three components are needed:</p>
+  <ul>
+    <li><b>Provider:</b> builds notification requests and sends them to <b>Apple Push Notification Service (APNs)</b>. It supplies two things:
+      <ul>
+        <li><b>Device token:</b> a unique identifier used to send push notifications to one device.</li>
+        <li><b>Payload:</b> a JSON dictionary with the notification's content (example below).</li>
+      </ul>
+    </li>
+    <li><b>APNs:</b> a remote service run by Apple that propagates push notifications to iOS devices.</li>
+    <li><b>iOS device:</b> the end client that receives the notification.</li>
+  </ul>
+  <figure class="fig medium">
+    <img src="../assets/img/p-153-122.jpg" alt="Provider sends to APNs, which sends to the iOS device">
+    <figcaption><b>Figure 10-2</b> · Provider → APNs → iOS. The other channels have the same three-part shape.</figcaption>
+  </figure>
+  <pre><code>{
+  "aps": {
+    "alert": {
+      "title": "Game Request",
+      "body": "Bob wants to play chess",
+      "action-loc-key": "PLAY"
+    },
+    "badge": 5
+  }
+}</code></pre>
+
+  <h4>Android, SMS and email</h4>
+  <table>
+    <tr><th>Channel</th><th>Third-party service</th><th>Address</th><th>Notes</th></tr>
+    <tr><td><b>iOS push</b></td><td>APNs</td><td>Device token</td><td>Token + JSON payload</td></tr>
+    <tr><td><b>Android push</b></td><td><b>Firebase Cloud Messaging (FCM)</b></td><td>Device token</td><td>Same flow as iOS</td></tr>
+    <tr><td><b>SMS</b></td><td><b>Twilio</b>, <b>Nexmo</b>, others</td><td>Phone number</td><td>Mostly commercial</td></tr>
+    <tr><td><b>Email</b></td><td><b>Sendgrid</b>, <b>Mailchimp</b></td><td>Email address</td><td>Own mail servers are possible, but these give better delivery rates and analytics</td></tr>
+  </table>
+  <figure class="fig small">
+    <img src="../assets/img/p-155-127.jpg" alt="Third-party services APNs, FCM, SMS service and email service each delivering to iOS, Android, SMS and email clients">
+    <figcaption><b>Figure 10-6</b> · All four third-party services. Each follows the provider → service → device shape of 10-2.</figcaption>
+  </figure>
+
+  <h3>Contact info gathering flow</h3>
+  <p>To send anything you need device tokens, phone numbers or email addresses. When a user <b>installs the app or signs up for the first time</b>, API servers collect the contact info and store it in the database.</p>
+  <figure class="fig">
+    <img src="../assets/img/p-155-128.jpg" alt="User on app install or sign-up goes through load balancer to API servers, which store contact info in the DB">
+    <figcaption><b>Figure 10-7</b> · User → load balancer → API servers → DB, on install or sign-up.</figcaption>
+  </figure>
+  <p>Email and phone number live in the <code>user</code> table. Device tokens live in a separate <code>device</code> table, because <b>one user can have many devices</b> (1 : *), and a push can go to all of them. (Figure 10-8, transcribed.)</p>
+  <table>
+    <tr><th>Table</th><th>Columns</th></tr>
+    <tr><td><b>user</b></td><td><code>user_id</code> bigint · <code>email</code> varchar · <code>country_code</code> integer · <code>phone_number</code> integer · <code>created_at</code> timestamp</td></tr>
+    <tr><td><b>device</b></td><td><code>id</code> bigint · <code>device_token</code> varchar · <code>user_id</code> bigint (→ user) · <code>last_logged_in_at</code> timestamp</td></tr>
+  </table>
+
+  <h3>Sending/receiving flow: initial design</h3>
+  <figure class="fig">
+    <img src="../assets/img/p-156-130.jpg" alt="Services 1 to N call a single notification system, which fans out to APNs, FCM, SMS service and email service, which deliver to devices">
+    <figcaption><b>Figure 10-9</b> · Everything goes through one notification system box. Simple, but that box is the problem.</figcaption>
+  </figure>
+  <ul>
+    <li><b>Service 1 to N:</b> whatever triggers a notification: a microservice, cron job or distributed system. E.g. a billing service emailing payment reminders, a shopping site texting that a package arrives tomorrow.</li>
+    <li><b>Notification system:</b> the centerpiece; to start, <b>one notification server</b>. It exposes APIs to services 1 to N and builds payloads for the third parties.</li>
+    <li><b>Third-party services:</b> deliver to users. Design for <b>extensibility</b> (easy to plug in or unplug a provider), because a provider may be unavailable in a new market or in future. <b>FCM is unavailable in China</b>, so <b>Jpush</b>, <b>PushY</b> etc. are used there.</li>
+    <li><b>iOS, Android, SMS, email:</b> the user's devices.</li>
+  </ul>
+  <aside class="callout warn">
+    <span class="callout-label">Pitfall</span>
+    <p>The initial design has three problems:</p>
+    <ul>
+      <li><b>Single point of failure (SPOF):</b> one notification server.</li>
+      <li><b>Hard to scale:</b> you can't scale the database, caches and processing components independently.</li>
+      <li><b>Performance bottleneck:</b> building HTML pages and waiting on third-party responses is slow and resource-intensive; one system doing it all can overload, especially at peak hours.</li>
+    </ul>
+  </aside>
+
+  <h3>Sending/receiving flow: improved design</h3>
+  <p>Three changes fix those problems:</p>
+  <ul>
+    <li>Move the <b>database and cache out</b> of the notification server.</li>
+    <li>Add <b>more notification servers</b> with <b>automatic horizontal scaling</b>.</li>
+    <li>Introduce <b>message queues</b> to decouple the components.</li>
+  </ul>
+  <figure class="fig">
+    <img src="../assets/img/p-158-131.jpg" alt="Services call notification servers backed by cache and DB; servers push to iOS PN, Android PN, SMS and email queues; workers pull from each queue and call APNs, FCM, SMS service and email service; retry on error loops back to the queue">
+    <figcaption><b>Figure 10-10</b> · Read left to right and follow the numbers 1–6. Each channel has its own queue and worker pool. Note the "retry on error" arrow.</figcaption>
+  </figure>
+  <table>
+    <tr><th>Component</th><th>Role</th></tr>
+    <tr><td><b>Service 1 to N</b></td><td>Call the notification servers' APIs.</td></tr>
+    <tr><td><b>Notification servers</b></td><td>
+      <ul>
+        <li>Provide send APIs, <b>only reachable internally or by verified clients</b> (prevents spam).</li>
+        <li>Validate basics: email addresses, phone numbers, etc.</li>
+        <li>Fetch the data needed to render a notification from cache or DB.</li>
+        <li>Put notification data on message queues for parallel processing.</li>
+      </ul></td></tr>
+    <tr><td><b>Cache</b></td><td>User info, device info, notification templates.</td></tr>
+    <tr><td><b>DB</b></td><td>Users, notifications, settings, etc.</td></tr>
+    <tr><td><b>Message queues</b></td><td>Remove dependencies between components; buffer high volumes. <b>One queue per notification type.</b></td></tr>
+    <tr><td><b>Workers</b></td><td>Pull events from the queues and send them to the matching third-party service.</td></tr>
+    <tr><td><b>Third parties, devices</b></td><td>As in the initial design.</td></tr>
+  </table>
+  <aside class="callout key">
+    <span class="callout-label">Key idea</span>
+    <p>One queue per channel isolates failures: if one third-party service (say APNs) has an outage, only its queue backs up and the other notification types keep flowing.</p>
+  </aside>
+  <h4>Example send API</h4>
+  <p>The book's email example: <code>POST https://api.example.com/v/sms/send</code> with this body. (The path says <code>sms</code> for an email; <code>/v/email/send</code> would fit better.)</p>
+  <pre><code>{
+  "to": [
+    { "user_id": 123456 }
+  ],
+  "from": {
+    "email": "from_address@example.com"
+  },
+  "subject": "Hello, World!",
+  "content": [
+    { "type": "text/plain", "value": "Hello, World!" }
+  ]
+}</code></pre>
+  <h4>How a notification flows through the system</h4>
+  <ol class="flow">
+    <li>A service calls the notification servers' API to send a notification.</li>
+    <li>Notification servers fetch metadata (user info, device token, notification setting) from the cache or database.</li>
+    <li>A notification event goes to the queue for its type. An iOS push event goes to the <b>iOS PN queue</b>.</li>
+    <li>Workers pull notification events from the queues.</li>
+    <li>Workers send the notifications to the third-party services.</li>
+    <li>Third-party services deliver the notifications to user devices.</li>
+  </ol>
+</section>
+
+<section id="step-3">
+  <h2><span class="step-num">Step 3</span>Design deep dive</h2>
+  <p class="one-liner">Make delivery <b>reliable</b> (never lost, rarely duplicated), then add the components a real notification system needs.</p>
+
+  <h3>Reliability</h3>
+  <h4>How do you prevent data loss?</h4>
+  <p>A notification system <b>must not lose data</b>: <b>notifications can be delayed or re-ordered, but never lost</b>. To meet this, the system <b>persists notification data in a database</b> (the <b>notification log</b>) and implements a <b>retry mechanism</b>.</p>
+  <figure class="fig small">
+    <img src="../assets/img/p-160-133.jpg" alt="Workers pull from the iOS PN queue, send to APNs and write to a notification log database">
+    <figcaption><b>Figure 10-11</b> · Workers record each notification in the notification log, so a failed send can be retried rather than lost.</figcaption>
+  </figure>
+
+  <h4>Will recipients receive a notification exactly once?</h4>
+  <p><b>No.</b> Most notifications are delivered exactly once, but in a distributed system duplicates can happen. To reduce them, add a <b>dedupe mechanism</b> and handle each failure case carefully:</p>
+  <ol class="flow">
+    <li>When a notification event arrives, check whether its <b>event ID</b> has been seen before.</li>
+    <li>If it has, discard the event.</li>
+    <li>Otherwise, send the notification.</li>
+  </ol>
+  <aside class="callout note">
+    <span class="callout-label">Beyond the book</span>
+    <p><b>Why exactly-once is impossible</b> (the book's reference [5]): a worker sends to APNs, then crashes or loses the response before recording success. It can't tell whether the send happened: retrying risks a duplicate, not retrying risks a loss. Since loss is unacceptable, you get <b>at-least-once delivery plus dedupe</b>.</p>
+  </aside>
+
+  <h3>Additional components and considerations</h3>
+  <h4>Notification template</h4>
+  <p>Many notifications share a format. A <b>notification template</b> is a preformatted notification you customize (parameters, styling, tracking links) instead of building each from scratch. Example push template:</p>
+  <pre><code>BODY:
+You dreamed of it. We dared it. [ITEM NAME] is back — only until [DATE].
+
+CTA:
+Order Now. Or, Save My [ITEM NAME]</code></pre>
+  <p>Benefits: a <b>consistent format</b>, a <b>smaller margin of error</b>, and <b>time saved</b>.</p>
+
+  <h4>Notification setting</h4>
+  <p>Users easily feel overwhelmed, so apps give fine-grained control, stored in a <b>notification setting table</b>:</p>
+  <table>
+    <tr><th>Field</th><th>Type</th><th>Meaning</th></tr>
+    <tr><td><code>user_id</code></td><td>bigInt</td><td>The user</td></tr>
+    <tr><td><code>channel</code></td><td>varchar</td><td>Push notification, email or SMS</td></tr>
+    <tr><td><code>opt_in</code></td><td>boolean</td><td>Whether the user opts in to this channel</td></tr>
+  </table>
+  <p><b>Before sending any notification, check that the user is opted in</b> to that type.</p>
+
+  <h4>Rate limiting</h4>
+  <p>Limit how many notifications one user can receive. If you send too often, users may turn notifications off completely.</p>
+
+  <h4>Retry mechanism</h4>
+  <p>When a third-party service fails to send a notification, <b>put the notification back on the message queue</b> to retry. If the problem persists, <b>send an alert to developers</b>.</p>
+  <aside class="callout note">
+    <span class="callout-label">Beyond the book</span>
+    <p>Common follow-up: space retries with <b>exponential backoff</b> (plus random jitter) so you don't hammer a struggling provider. After the maximum number of attempts, move the event to a <b>dead-letter queue</b> for inspection instead of retrying forever.</p>
+  </aside>
+
+  <h4>Security in push notifications</h4>
+  <p>iOS and Android apps use an <b>appKey</b> and <b>appSecret</b> to secure the push notification APIs. Only authenticated or verified clients can send push notifications through your APIs.</p>
+
+  <h4>Monitor queued notifications</h4>
+  <p>The key metric is the <b>total number of queued notifications</b>. If it's large, workers aren't processing events fast enough. <b>Add more workers</b> to avoid delivery delays.</p>
+  <figure class="fig medium">
+    <img src="../assets/img/p-162-134.jpg" alt="Line chart of queued messages over the last minute, spiking to about 200">
+    <figcaption><b>Figure 10-12</b> · Queued messages over one minute (a RabbitMQ dashboard). A rising line means workers are falling behind.</figcaption>
+  </figure>
+
+  <h4>Events tracking</h4>
+  <p>Metrics such as <b>open rate, click rate and engagement</b> help you understand customer behavior. An <b>analytics service</b> implements event tracking, so the notification system usually needs to integrate with it.</p>
+  <figure class="fig medium">
+    <img src="../assets/img/p-162-135.jpg" alt="Event states: start, pending, sent, deliver, then click or unsubscribe; pending and sent can go to error">
+    <figcaption><b>Figure 10-13</b> · Events to track: start → pending → sent → deliver → click or unsubscribe. Both pending and sent can end in error.</figcaption>
+  </figure>
+
+  <h3>Updated design</h3>
+  <p>Figure 10-14 (in the <a href="#tldr">TL;DR</a>) puts it all together. New since Figure 10-10:</p>
+  <ul>
+    <li><b>Authentication and rate limiting</b> on the notification servers.</li>
+    <li>A <b>retry mechanism</b>: failed notifications go back on the queue, and workers retry a <b>predefined number of times</b>.</li>
+    <li><b>Notification templates</b> for a consistent, efficient creation process.</li>
+    <li><b>Monitoring and tracking</b> for health checks and future improvements. The analytics service gets "send pending" from notification servers, "sent" from workers and "click tracking" from the device.</li>
+  </ul>
+  <p>Workers also read <b>notification templates</b> and write the <b>notification log</b>; the DB holds <b>device, setting and user info</b>.</p>
+</section>
+
+<section id="step-4">
+  <h2><span class="step-num">Step 4</span>Wrap up</h2>
+  <p>You designed a scalable notification system that supports push, SMS and email, using <b>message queues to decouple</b> its components. Points to raise:</p>
+  <ul>
+    <li><b>Reliability:</b> a robust retry mechanism minimizes the failure rate.</li>
+    <li><b>Security:</b> an appKey/appSecret pair ensures only verified clients can send notifications.</li>
+    <li><b>Tracking and monitoring:</b> implemented at every stage of the notification flow to capture important stats.</li>
+    <li><b>Respect user settings:</b> users may opt out, so check their settings before sending.</li>
+    <li><b>Rate limiting:</b> users appreciate a cap on how many notifications they receive.</li>
+  </ul>
+</section>
+
+<section id="self-test">
+  <h2>Self-test</h2>
+  <details class="qa"><summary>What are the requirements and daily volumes for this notification system?</summary><div><p>Push, SMS and email; soft real-time; iOS, Android and laptop/desktop; triggered by clients or scheduled server-side; users can opt out. Daily: <b>10M push, 1M SMS, 5M email</b>.</p></div></details>
+  <details class="qa"><summary>What does "soft real-time" mean here?</summary><div><p>Deliver as soon as possible, but a slight delay is acceptable when the system is under high workload.</p></div></details>
+  <details class="qa"><summary>Which third-party service delivers each channel?</summary><div><p>iOS → APNs, Android → FCM, SMS → Twilio or Nexmo, email → Sendgrid or Mailchimp.</p></div></details>
+  <details class="qa"><summary>What two things does a provider send to APNs?</summary><div><p>A <b>device token</b> (unique identifier of the target device) and a <b>payload</b> (a JSON dictionary with the notification content, e.g. <code>aps.alert.title</code>, <code>body</code>, <code>badge</code>).</p></div></details>
+  <details class="qa"><summary>When and where is contact info collected, and why are device tokens in their own table?</summary><div><p>API servers collect it when a user installs the app or signs up, and store it in the DB. Email and phone go in <code>user</code>; tokens go in <code>device</code> because one user can have many devices, and a push can go to all of them.</p></div></details>
+  <details class="qa"><summary>Why must third-party integration be extensible?</summary><div><p>A provider may be unavailable in new markets or in the future. For example, FCM is unavailable in China, where alternatives like Jpush or PushY are used. You need to plug providers in and out easily.</p></div></details>
+  <details class="qa"><summary>What are the three problems with the single-notification-server design?</summary><div><p>Single point of failure; hard to scale DB, cache and processing components independently; performance bottleneck from resource-intensive work like building HTML and waiting on third parties, especially at peak.</p></div></details>
+  <details class="qa"><summary>What three changes produce the improved design?</summary><div><p>Move the DB and cache out of the notification server, add more notification servers with automatic horizontal scaling, and introduce message queues to decouple components.</p></div></details>
+  <details class="qa"><summary>Why give each notification type its own message queue?</summary><div><p>So an outage at one third-party service doesn't affect other notification types. Queues also buffer high volumes.</p></div></details>
+  <details class="qa"><summary>List the six steps of sending a notification in the improved design.</summary><div><p>1) Service calls notification server API. 2) Server fetches user info, device token and settings from cache/DB. 3) Event goes to its channel's queue. 4) Workers pull events. 5) Workers send to the third party. 6) Third party delivers to the device.</p></div></details>
+  <details class="qa"><summary>How does the system avoid losing notifications?</summary><div><p>It persists notification data in a notification log database and retries failures by putting them back on the queue (a predefined number of times), alerting developers if the problem persists.</p></div></details>
+  <details class="qa"><summary>Can you guarantee exactly-once delivery? What do you do instead?</summary><div><p>No; distributed failures can cause duplicates. Dedupe by event ID: if an arriving event's ID was seen before, discard it; otherwise send.</p></div></details>
+  <details class="qa"><summary>What is the notification setting table, and when is it checked?</summary><div><p><code>user_id</code> (bigInt), <code>channel</code> (push, email or SMS), <code>opt_in</code> (boolean). It's checked before any notification is sent.</p></div></details>
+  <details class="qa"><summary>How are push notification APIs secured?</summary><div><p>With an appKey and appSecret, so only authenticated or verified clients can send push notifications.</p></div></details>
+  <details class="qa"><summary>What is the key metric to monitor, and how do you react when it grows?</summary><div><p>The total number of queued notifications. A large number means workers are too slow, so add more workers.</p></div></details>
+</section>
+
+<section id="glossary">
+  <h2>Terms to know</h2>
+  <dl class="glossary">
+    <dt>APNs</dt><dd>Apple Push Notification Service: Apple's remote service that delivers push notifications to iOS devices.</dd>
+    <dt>FCM</dt><dd>Firebase Cloud Messaging: the common service for sending push notifications to Android devices.</dd>
+    <dt>Provider</dt><dd>Your server-side component that builds notification requests and sends them to APNs/FCM.</dd>
+    <dt>Device token</dt><dd>Unique identifier for one device, needed to send it a push notification.</dd>
+    <dt>Soft real-time</dt><dd>Deliver as fast as possible, but small delays under load are acceptable.</dd>
+    <dt>Message queue</dt><dd>A buffer between producers and consumers that decouples them and absorbs bursts.</dd>
+    <dt>Worker</dt><dd>A server that pulls events from a queue and calls a third-party service.</dd>
+    <dt>Notification log</dt><dd>A database of notification data, persisted so failed sends can be retried, not lost.</dd>
+    <dt>Dedupe</dt><dd>Discarding an event whose event ID has already been seen, to reduce duplicate notifications.</dd>
+    <dt>Notification template</dt><dd>A preformatted notification you customize with parameters, styling and tracking links.</dd>
+    <dt>appKey / appSecret</dt><dd>Credential pair that restricts the push APIs to verified clients.</dd>
+  </dl>
+  <details class="more refs"><summary>Book references (go deeper)</summary><div><ol>
+    <li><a href="https://www.twilio.com/sms">Twilio SMS</a></li>
+    <li><a href="https://www.nexmo.com/products/sms">Nexmo SMS</a></li>
+    <li><a href="https://sendgrid.com/">Sendgrid</a></li>
+    <li><a href="https://mailchimp.com/">Mailchimp</a></li>
+    <li><a href="https://bravenewgeek.com/you-cannot-have-exactly-once-delivery/">You Cannot Have Exactly-Once Delivery</a></li>
+    <li><a href="https://cloud.ibm.com/docs/services/mobilepush?topic=mobile-pushnotification-security-in-push-notifications">Security in Push Notifications</a></li>
+    <li><a href="https://bit.ly/2sotIa6">RabbitMQ</a> (misspelled "RadditMQ" in the book)</li>
+  </ol></div></details>
+</section>
+
+</main>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

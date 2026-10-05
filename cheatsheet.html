@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cheat sheet — SDI Fast Track</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=localStorage.getItem("sdi:theme");if(t)document.documentElement.dataset.theme=JSON.parse(t)}catch(e){}</script>
+</head>
+<body data-root=".">
+<main class="page">
+  <header class="chapter-hero">
+    <p class="eyebrow">Revision</p>
+    <h1>The whole book on one page</h1>
+    <p class="lede">Every chapter's TL;DR in one place. Skim it the night before an interview, or print it (⌘P). Click a chapter title to open the full walkthrough.</p>
+  </header>
+<section class="cs-block" id="ch1"><h2><small>Chapter 1</small><a href="chapters/01-scale-from-zero-to-millions.html">Scale from Zero to Millions of Users</a></h2>
+  
+  <ul>
+    <li><b>Scaling is iterative:</b> each stage fixes today's bottleneck and exposes the next one.</li>
+    <li><b>Split tiers, then scale out:</b> separate the web and data tiers, then add web servers behind a <b>load balancer</b> (public IP outside, private IPs inside).</li>
+    <li><b>Stateless web tier:</b> keep session data in a shared store (NoSQL), so any server can serve any request and the tier can <b>autoscale</b>.</li>
+    <li><b>Replicate the database:</b> writes go to the master, reads to the slaves. If the master dies, promote a slave.</li>
+    <li><b>Cache + CDN:</b> keep hot, rarely-changing data in memory (set expiry, plan for consistency, avoid a single point of failure, evict LRU). Serve static files from a CDN with TTLs.</li>
+    <li><b>Multiple data centers:</b> geoDNS sends users to the nearest one. You must solve traffic redirection, data sync and deployment.</li>
+    <li><b>Message queues</b> decouple slow work so producers and consumers scale independently. Add logging, metrics and automation.</li>
+    <li><b>Shard the data tier</b> by a key that spreads data evenly (e.g. <code>user_id % 4</code>). Expect resharding, celebrity hotspots and cross-shard joins (fix: denormalize).</li>
+  </ul>
+  <figure class="fig">
+    <img src="assets/img/p-031-025.jpg" alt="Final architecture: DNS, CDN, load balancer, web servers in a data center, sharded databases, caches, message queue with workers, a NoSQL store, and logging, metrics, monitoring and automation tools">
+    <figcaption><b>Figure 1-23</b> · Where the chapter ends. Trace a request: DNS → load balancer → stateless web servers → cache / sharded DB / NoSQL; slow jobs go via the queue to workers.</figcaption>
+  </figure>
+</section>
+<section class="cs-block" id="ch2"><h2><small>Chapter 2</small><a href="chapters/02-back-of-the-envelope.html">Back-of-the-Envelope Estimation</a></h2>
+  
+  <ul>
+    <li><b>Goal:</b> quick estimates from thought experiments and common performance numbers that show which designs meet the requirements. The <b>process</b> is graded, not precision.</li>
+    <li><b>Powers of two:</b> 2<sup>10</sup> ≈ thousand (KB), 2<sup>20</sup> ≈ million (MB), 2<sup>30</sup> ≈ billion (GB), 2<sup>40</sup> ≈ trillion (TB), 2<sup>50</sup> ≈ quadrillion (PB). 1 ASCII character = 1 byte = 8 bits.</li>
+    <li><b>Latency lessons:</b> memory is fast, disk is slow: avoid disk seeks. Compression is cheap: compress before sending over the internet. Cross-region trips are slow.</li>
+    <li><b>Availability:</b> each extra nine cuts downtime 10×: 99.9% ≈ 8.77 h/year, 99.99% ≈ 52.6 min/year. Big cloud SLAs are ≥ 99.9%.</li>
+    <li><b>QPS</b> = DAU × actions per day ÷ 86,400 s (≈ 10<sup>5</sup>). <b>Peak QPS</b> ≈ 2 × QPS.</li>
+    <li><b>Storage</b> = items per day × size × 365 × years.</li>
+    <li><b>Twitter example:</b> 150 M DAU × 2 tweets → ~3,500 QPS, ~7,000 peak. 10% carry 1 MB media → 30 TB/day → ~55 PB over 5 years.</li>
+    <li><b>Tips:</b> round aggressively, write assumptions down, label every unit.</li>
+  </ul>
+  <div class="stats">
+    <div class="stat"><b>100 ns</b><span>main memory reference</span></div>
+    <div class="stat"><b>0.5 ms</b><span>round trip inside one datacenter</span></div>
+    <div class="stat"><b>10 ms</b><span>disk seek</span></div>
+    <div class="stat"><b>150 ms</b><span>California ↔ Netherlands round trip</span></div>
+  </div>
+</section>
+<section class="cs-block" id="ch3"><h2><small>Chapter 3</small><a href="chapters/03-interview-framework.html">A Framework for System Design Interviews</a></h2>
+  
+  <ul>
+    <li><b>What it simulates:</b> two co-workers solving an ambiguous problem together. There's no perfect answer; the <b>process</b> counts more than the final design.</li>
+    <li><b>What's scored:</b> design skill, collaboration, working under pressure, resolving ambiguity, and <b>asking good questions</b>.</li>
+    <li><b>Red flags:</b> over-engineering (design purity over trade-offs), narrow-mindedness, stubbornness.</li>
+    <li><b>Step 1 · Scope:</b> don't jump to a solution. Ask about features, users, growth and tech stack; write assumptions down.</li>
+    <li><b>Step 2 · High-level design:</b> box diagram, back-of-the-envelope check, a few use cases, and the interviewer's agreement.</li>
+    <li><b>Step 3 · Deep dive:</b> prioritize components with the interviewer; skip details that don't show you can design a scalable system.</li>
+    <li><b>Step 4 · Wrap up:</b> bottlenecks and improvements, recap, error cases, operations, the next scale curve.</li>
+    <li><b>Throughout:</b> think out loud, offer multiple approaches, ask for hints when stuck. You're done only when the interviewer says so.</li>
+  </ul>
+  <div class="stats">
+    <div class="stat"><b>3–10 min</b><span>Step 1 · Understand the problem, set scope</span></div>
+    <div class="stat"><b>10–15 min</b><span>Step 2 · High-level design &amp; buy-in</span></div>
+    <div class="stat"><b>10–25 min</b><span>Step 3 · Design deep dive</span></div>
+    <div class="stat"><b>3–5 min</b><span>Step 4 · Wrap up</span></div>
+  </div>
+</section>
+<section class="cs-block" id="ch4"><h2><small>Chapter 4</small><a href="chapters/04-rate-limiter.html">Design a Rate Limiter</a></h2>
+  
+  <ul>
+    <li><b>What:</b> cap the requests a client (user, IP, device…) sends per time period; reject the excess with <b>HTTP 429 Too Many Requests</b>. Prevents DoS, cuts cost, stops overload.</li>
+    <li><b>Scope:</b> server-side, distributed, flexible rules, low latency, little memory, fault tolerant, and it tells throttled users.</li>
+    <li><b>Where:</b> not the client (requests can be forged). Put it in the API servers or in <b>middleware / an API gateway</b>.</li>
+    <li><b>Five algorithms:</b> token bucket (allows bursts; Amazon, Stripe), leaking bucket (FIFO queue, fixed outflow; Shopify), fixed window counter (up to 2× at window edges), sliding window log (exact, memory-hungry), sliding window counter (current + previous × overlap; cheap approximation).</li>
+    <li><b>Counters live in Redis</b> (in-memory, with expiry): <code>INCR</code> + <code>EXPIRE</code>. Rules live in config files, cached by workers.</li>
+    <li><b>Headers:</b> <code>X-Ratelimit-Remaining</code>, <code>-Limit</code>, <code>-Retry-After</code>. Throttled requests are dropped or queued.</li>
+    <li><b>Distributed:</b> race conditions → Lua script or Redis sorted sets (not locks). Many limiters → one central Redis (not sticky sessions).</li>
+    <li><b>Extras:</b> edge data centers, eventual consistency, monitoring, hard vs soft limits, layer-3 limiting (iptables), client best practices.</li>
+  </ul>
+  <figure class="fig">
+    <img src="assets/img/p-065-046.jpg" alt="Detailed design: client to rate limiter middleware, which reads cached rules (loaded by workers from disk) and counters in Redis, forwards successes to API servers, and on rate limit returns 429 and either drops the request or sends it to a message queue">
+    <figcaption><b>Figure 4-13</b> · The final design. Middleware checks cached rules and Redis counters; success goes to the API servers, the rest get a 429 and are dropped or queued.</figcaption>
+  </figure>
+</section>
+<section class="cs-block" id="ch5"><h2><small>Chapter 5</small><a href="chapters/05-consistent-hashing.html">Design Consistent Hashing</a></h2>
+  
+  <ul>
+    <li><b>Problem:</b> with <code>serverIndex = hash(key) % N</code>, adding or removing one server <b>remaps most keys</b>, causing a storm of cache misses.</li>
+    <li><b>Consistent hashing:</b> on a resize only <b>k/n keys move on average</b> (k keys, n slots), not nearly all.</li>
+    <li><b>Hash ring:</b> the hash space (SHA-1: 0 to 2<sup>160</sup> − 1) with its ends joined. Servers (by IP or name) and keys are hashed onto it with the same function, no modulo.</li>
+    <li><b>Lookup:</b> from the key, go <b>clockwise</b> to the first server.</li>
+    <li><b>Add/remove a server:</b> only keys between that node and the previous server (anticlockwise) move.</li>
+    <li><b>Basic ring's two flaws:</b> unequal partitions, and keys piling up on one server.</li>
+    <li><b>Fix: virtual nodes</b>, many ring points per server. 100 per server → standard deviation ≈ 10% of the mean; 200 → ≈ 5%. Cost: more metadata.</li>
+    <li><b>Used by:</b> Dynamo, Cassandra, Discord, Akamai CDN, Maglev.</li>
+  </ul>
+  <figure class="fig medium">
+    <img src="assets/img/p-077-059.jpg" alt="Hash ring with four servers s0 to s3 and four keys k0 to k3; arrows go clockwise from each key to the next server">
+    <figcaption><b>Figure 5-7</b> · The whole idea: each key walks clockwise to the next server.</figcaption>
+  </figure>
+</section>
+<section class="cs-block" id="ch6"><h2><small>Chapter 6</small><a href="chapters/06-key-value-store.html">Design a Key-Value Store</a></h2>
+  
+  <ul>
+    <li><b>Goal:</b> <code>put(key, value)</code> and <code>get(key)</code> for small pairs (&lt; 10 KB) at big-data scale, with high availability, automatic scaling, tunable consistency and low latency.</li>
+    <li>One server (an in-memory hash table) fills up fast, so the store must be <b>distributed</b>.</li>
+    <li><b>CAP:</b> network partitions are unavoidable, so choose <b>CP</b> (block writes, like a bank) or <b>AP</b> (keep serving, maybe stale). This design is AP with <b>eventual consistency</b>, like Dynamo and Cassandra.</li>
+    <li><b>Partition</b> with consistent hashing (virtual nodes). <b>Replicate</b> each key on the next <b>N distinct servers</b> clockwise, spread across data centers.</li>
+    <li><b>Quorum:</b> a write waits for <b>W</b> acks, a read for <b>R</b> replies. <b>W + R &gt; N ⇒ strong consistency</b> (usually N = 3, W = R = 2).</li>
+    <li><b>Vector clocks</b> (<code>[server, counter]</code> pairs) detect conflicting versions; the client reconciles them.</li>
+    <li><b>Failures:</b> gossip detects them; sloppy quorum + hinted handoff ride out temporary ones; Merkle-tree anti-entropy repairs permanent ones; cross-data-center replication survives outages.</li>
+    <li><b>Per node (Cassandra-style):</b> write = commit log → memory cache → flush to SSTables. Read = memory cache → bloom filter → SSTables.</li>
+  </ul>
+  <figure class="fig">
+    <img src="assets/img/p-104-085.jpg" alt="Client sends read/write to coordinator node n6 on a ring of nodes n0 to n7; n6 forwards to replicas n0, n1, n2 and returns the response">
+    <figcaption><b>Figure 6-17</b> · The whole design: any node can coordinate; it forwards to the key's N replicas on the ring.</figcaption>
+  </figure>
+</section>
+<section class="cs-block" id="ch7"><h2><small>Chapter 7</small><a href="chapters/07-unique-id-generator.html">Design a Unique ID Generator in Distributed Systems</a></h2>
+  
+  <ul>
+    <li><b>Problem:</b> generate IDs that are <b>unique, numeric, 64-bit, ordered by time</b>, at <b>10,000+ IDs/sec</b> across many servers. A single database's <code>auto_increment</code> can't keep up, and coordinating it across databases is slow.</li>
+    <li><b>Four options:</b> multi-master replication (step by <i>k</i>), UUID (128-bit random), ticket server (one central counter), Twitter Snowflake (split the 64 bits into fields).</li>
+    <li><b>Winner: Snowflake.</b> <code>1 sign | 41 timestamp | 5 datacenter | 5 machine | 12 sequence</code>.</li>
+    <li><b>Timestamp sits in the high bits</b>, so IDs sort by time. 41 bits of milliseconds ≈ <b>69 years</b> from a custom epoch.</li>
+    <li><b>12-bit sequence</b> = <b>4,096 IDs per millisecond per machine</b>; it resets to 0 every millisecond.</li>
+    <li>Datacenter and machine IDs are <b>fixed at startup</b>. Changing them by accident can cause ID collisions.</li>
+    <li>Wrap-up talking points: <b>clock synchronization (NTP)</b>, <b>tuning section lengths</b>, <b>high availability</b>.</li>
+  </ul>
+  <figure class="fig">
+    <img src="assets/img/p-114-095.jpg" alt="Snowflake 64-bit layout: 1 sign bit, 41 timestamp bits, 5 datacenter bits, 5 machine bits, 12 sequence bits">
+    <figcaption><b>Figure 7-5</b> · The Snowflake ID layout. Memorize it: 1 + 41 + 5 + 5 + 12 = 64.</figcaption>
+  </figure>
+</section>
+<section class="cs-block" id="ch8"><h2><small>Chapter 8</small><a href="chapters/08-url-shortener.html">Design a URL Shortener</a></h2>
+  
+  <ul>
+    <li><b>Scale:</b> 100 million new URLs/day → <b>~1,160 writes/s</b>, <b>11,600 reads/s</b> (10:1), <b>365 billion</b> records in 10 years (~36.5 TB at 100 bytes each).</li>
+    <li><b>APIs:</b> <code>POST api/v1/data/shorten {longUrl}</code> → short URL; <code>GET api/v1/shortUrl</code> → redirect.</li>
+    <li><b>301 vs 302:</b> 301 is permanent and cached by the browser (less load); 302 sends every click through you (better analytics).</li>
+    <li><b>Storage:</b> relational table <code>(id, shortURL, longURL)</code>; an in-memory hash table is too expensive.</li>
+    <li><b>Length:</b> 62 characters <code>[0-9a-zA-Z]</code>; 62<sup>7</sup> ≈ 3.5 trillion ≥ 365 billion → <b>7 characters</b>.</li>
+    <li><b>Making the code:</b> hash (CRC32/MD5/SHA-1), keep 7 characters and resolve collisions, or <b>base-62 encode a unique ID</b>. Base 62 wins: no collisions, but length grows with the ID and codes are guessable.</li>
+    <li><b>Shorten:</b> long URL already stored? Return its code. Else new ID → base 62 → save.</li>
+    <li><b>Redirect:</b> load balancer → web server → cache → database.</li>
+    <li><b>Wrap-up:</b> rate limiter, web/DB scaling, analytics, availability.</li>
+  </ul>
+  <figure class="fig">
+    <img src="assets/img/p-129-109.jpg" alt="User sends GET for the short URL to a load balancer, which forwards to web servers that check a cache and then a database, and the long URL is returned">
+    <figcaption><b>Figure 8-8</b> · The redirect path (10× the write traffic), with a cache in front of the database.</figcaption>
+  </figure>
+</section>
+<section class="cs-block" id="ch9"><h2><small>Chapter 9</small><a href="chapters/09-web-crawler.html">Design a Web Crawler</a></h2>
+  
+  <ul>
+    <li><b>Scope:</b> crawl for <b>search engine indexing</b>, <b>1 billion HTML pages/month</b>, include new and edited pages, store pages for <b>5 years</b>, ignore duplicate content.</li>
+    <li><b>Numbers:</b> ~400 pages/s (800 peak) · 500 KB per page → 500 TB/month → <b>30 PB</b> over 5 years.</li>
+    <li><b>A good crawler is</b> scalable, robust, polite and extensible.</li>
+    <li><b>The loop:</b> seed URLs → URL frontier → HTML downloader (+ DNS resolver) → content parser → “content seen?” → URL extractor → URL filter → “URL seen?” → frontier.</li>
+    <li><b>Dedupe twice:</b> compare page <b>hashes</b> (~29% of pages are duplicates); track known URLs with a <b>Bloom filter or hash table</b>.</li>
+    <li><b>BFS, not DFS</b> (DFS goes too deep). A plain FIFO floods one host and ignores importance, so the <b>URL frontier</b> uses <b>front queues</b> for priority and <b>back queues</b> (one host per queue, one worker per queue) for politeness.</li>
+    <li><b>Downloader:</b> obey cached <b>robots.txt</b>; go faster with distributed crawl, a DNS cache, locality and short timeouts.</li>
+    <li><b>Stay safe:</b> consistent hashing, saved crawl state, a max URL length against <b>spider traps</b>, and filtering out noise.</li>
+  </ul>
+  <figure class="fig">
+    <img src="assets/img/p-139-113.jpg" alt="Web crawler architecture with numbered steps: seed URLs, URL frontier, HTML downloader with DNS resolver, content parser, content seen with content storage, link extractor, URL filter, URL seen with URL storage, and a loop back to the URL frontier">
+    <figcaption><b>Figure 9-4</b> · The whole design. Follow the numbers 1 → 11: new URLs loop back from “URL Seen?” into the frontier.</figcaption>
+  </figure>
+</section>
+<section class="cs-block" id="ch10"><h2><small>Chapter 10</small><a href="chapters/10-notification-system.html">Design a Notification System</a></h2>
+  
+  <ul>
+    <li><b>Scope:</b> push (iOS, Android), SMS and email. <b>Soft real-time</b>, opt-out supported, <b>10M push + 1M SMS + 5M email per day</b>.</li>
+    <li><b>Third parties deliver:</b> iOS → <b>APNs</b>, Android → <b>FCM</b>, SMS → <b>Twilio/Nexmo</b>, email → <b>Sendgrid/Mailchimp</b>. Collect device tokens, phone numbers and emails at install or sign-up.</li>
+    <li><b>Flow:</b> services → <b>notification servers</b> (auth, rate limit, validate, read user/device/settings from cache/DB) → <b>one message queue per channel</b> → <b>workers</b> → third party → device.</li>
+    <li>Queues decouple components and absorb spikes. One queue per channel means <b>one provider's outage doesn't block the other channels</b>.</li>
+    <li><b>Never lose a notification:</b> persist it in a <b>notification log</b>; on failure, put it back on the queue to retry, and alert developers if failures persist.</li>
+    <li><b>Exactly-once delivery is impossible.</b> Reduce duplicates by deduping on <b>event ID</b>.</li>
+    <li>Also: templates, per-channel opt-in settings, per-user rate limiting, <b>appKey/appSecret</b>, queue-depth monitoring, event tracking.</li>
+  </ul>
+  <figure class="fig">
+    <img src="assets/img/p-163-136.jpg" alt="Final notification system: service, notification servers with authentication and rate limit, cache and DB, iOS PN queue with retry loop, workers using templates and a notification log, APNs, iOS device, and an analytics service">
+    <figcaption><b>Figure 10-14</b> · The final design, shown for the iOS channel. Note the retry loop back into the queue, the notification log, and the analytics events (pending, sent, click).</figcaption>
+  </figure>
+</section>
+<section class="cs-block" id="ch11"><h2><small>Chapter 11</small><a href="chapters/11-news-feed.html">Design a News Feed System</a></h2>
+  
+  <ul>
+    <li><b>Scope:</b> web + mobile; publish posts and see friends' posts, <b>reverse chronological</b>; up to <b>5,000 friends</b>; <b>10M DAU</b>; posts can include images and videos.</li>
+    <li><b>APIs:</b> <code>POST /v1/me/feed</code> (<code>content</code>, <code>auth_token</code>) publishes; <code>GET /v1/me/feed</code> (<code>auth_token</code>) retrieves.</li>
+    <li><b>Publish:</b> web servers (auth + rate limit) → <b>post service</b> (post DB + cache), <b>fanout service</b> (into friends' feed caches), <b>notification service</b>.</li>
+    <li><b>Fanout on write (push):</b> fast reads, but slow for users with many friends (<b>hotkey problem</b>) and wasted on inactive users. <b>Fanout on read (pull):</b> no waste, no hotkey, but slow reads.</li>
+    <li><b>Hybrid:</b> push for most users; for <b>celebrities</b>, followers pull on demand. Consistent hashing spreads hotkeys.</li>
+    <li><b>Fanout steps:</b> friend IDs from a <b>graph DB</b> → filter by settings via user cache → <b>message queue</b> → <b>fanout workers</b> → feed cache stores only <code>&lt;post_id, user_id&gt;</code>, capped.</li>
+    <li><b>Retrieve:</b> post IDs from the feed cache, <b>hydrate</b> from user and post caches, return JSON. Media comes from a <b>CDN</b>.</li>
+    <li><b>Cache layers:</b> news feed, content, social graph, action, counters.</li>
+  </ul>
+  <figure class="fig">
+    <img src="assets/img/p-171-140.jpg" alt="Feed publishing design: user, load balancer, web servers with authentication and rate limiting, post service with post cache and DB, notification service, and fanout service that reads the graph DB and user cache, writes to a message queue, and fanout workers that write the news feed cache">
+    <figcaption><b>Figure 11-4</b> · The publishing path. Follow the fanout service's numbered steps 1–5: graph DB → user cache → queue → workers → news feed cache.</figcaption>
+  </figure>
+</section>
+<section class="cs-block" id="ch12"><h2><small>Chapter 12</small><a href="chapters/12-chat-system.html">Design a Chat System</a></h2>
+  
+  <ul>
+    <li><b>Scope:</b> 1-on-1 and small group chat (max 100), online presence, multi-device, push notifications. Text only (&lt; 100,000 chars), <b>50M DAU</b>, history kept forever.</li>
+    <li><b>WebSocket</b> for sending and receiving: a persistent, bidirectional connection upgraded from HTTP. Polling wastes requests; long polling breaks with stateless servers. Login and profiles use HTTP.</li>
+    <li><b>Components:</b> stateless API servers behind a load balancer, stateful <b>chat servers</b>, <b>presence servers</b>, <b>notification servers</b>, a <b>key-value store</b>.</li>
+    <li><b>Storage:</b> profiles in a relational DB; chat history (huge, recent-heavy, 1:1 read/write) in a KV store (Facebook: HBase, Discord: Cassandra). Order by <code>message_id</code>, not <code>created_at</code>.</li>
+    <li><b>Service discovery (Zookeeper)</b> picks the best chat server for each client at login.</li>
+    <li><b>1-on-1 flow:</b> chat server → ID generator → sync queue → KV store → recipient's chat server, or push notification if offline. Devices sync via their own <code>cur_max_message_id</code>.</li>
+    <li><b>Small groups:</b> copy each message into every member's sync queue (inbox); WeChat caps groups at 500.</li>
+    <li><b>Presence:</b> heartbeats (every 5 s, 30 s timeout) prevent flicker. Status fans out via a pub-sub channel per friend pair.</li>
+  </ul>
+  <figure class="fig">
+    <img src="assets/img/p-186-152.jpg" alt="Adjusted high-level design: user connects over HTTP through a load balancer to API servers and over WebSocket to a real-time service of chat servers and presence servers; API servers talk to notification servers; everything writes to a tier of KV stores">
+    <figcaption><b>Figure 12-8</b> · The final architecture. Two paths from the client: <b>http</b> to the load balancer and API servers, <b>ws</b> to the real-time chat and presence servers. History lands in the KV stores.</figcaption>
+  </figure>
+</section>
+<section class="cs-block" id="ch13"><h2><small>Chapter 13</small><a href="chapters/13-search-autocomplete.html">Design a Search Autocomplete System</a></h2>
+  
+  <ul>
+    <li><b>Problem:</b> return the <b>top 5</b> most-searched past queries that <b>start with</b> the typed prefix ("top k"). English, lowercase, no spell check, 10M DAU.</li>
+    <li><b>Requirements:</b> respond in <b>under 100 ms</b>, relevant, sorted by popularity, scalable, highly available.</li>
+    <li><b>Numbers:</b> one request per keystroke (~20 per search) → <b>~24,000 QPS</b>, <b>~48,000 peak</b>; <b>0.4 GB</b> of new data per day.</li>
+    <li><b>Naive version:</b> a frequency table plus <code>LIKE 'prefix%' ORDER BY frequency DESC LIMIT 5</code>. The database becomes the bottleneck.</li>
+    <li><b>Core: a trie</b> with prefix length capped (~50) and the <b>top 5 queries cached at every node</b>. Lookup drops from O(p + c + c log c) to <b>O(1)</b>: space traded for time.</li>
+    <li><b>Build offline, weekly:</b> analytics logs → aggregators → aggregated data → workers → Trie DB → Trie Cache.</li>
+    <li><b>Serve:</b> load balancer → API servers → Trie Cache (miss → Trie DB), plus AJAX, browser caching and log sampling.</li>
+    <li><b>Operate:</b> rebuild weekly and swap; hide bad suggestions with a <b>filter layer</b>. Shard by prefix via a <b>shard map manager</b>, since first-letter sharding is uneven.</li>
+  </ul>
+  <figure class="fig">
+    <img src="assets/img/p-210-173.jpg" alt="Trie where every node stores its top 5 queries, for example node be stores best 35, bet 29, bee 20, be 15, beer 10">
+    <figcaption><b>Figure 13-8</b> · Every node carries its own top-5 list, so answering a prefix is one node lookup.</figcaption>
+  </figure>
+</section>
+<section class="cs-block" id="ch14"><h2><small>Chapter 14</small><a href="chapters/14-youtube.html">Design YouTube</a></h2>
+  
+  <ul>
+    <li><b>Scope:</b> upload and watch videos on mobile, web and smart TV. 5M DAU, 30 min/day, many international users, videos up to <b>1 GB</b>, encryption, cloud services allowed.</li>
+    <li><b>Numbers:</b> 5M × 10% × 300 MB = <b>150 TB of new video per day</b>. CDN: 5M × 5 videos × 0.3 GB × $0.02 = <b>$150,000 per day</b>.</li>
+    <li><b>Rent, don't build</b> blob storage and the CDN. Clients <b>stream from the nearest CDN edge</b>; everything else goes through <b>API servers</b>.</li>
+    <li><b>Upload = two parallel flows.</b> Video: original storage → transcoding servers → transcoded storage → CDN, while a completion queue + handler update the metadata DB and cache. Metadata: client → API servers → DB and cache.</li>
+    <li><b>Transcoding</b> runs as a <b>DAG</b> of tasks: preprocessor → DAG scheduler → resource manager → task workers → encoded video.</li>
+    <li><b>Optimize:</b> GOP-chunked parallel uploads, upload centers near users, message queues between stages (speed); pre-signed URLs and DRM/AES/watermarks (safety); only popular videos on the CDN (cost).</li>
+    <li><b>Errors:</b> retry recoverable ones; stop and return an error code otherwise.</li>
+  </ul>
+  <figure class="fig medium">
+    <img src="assets/img/p-226-187.jpg" alt="Video upload architecture: user uploads to original storage, transcoding servers write to transcoded storage which feeds the CDN, and a completion queue and handler update the metadata cache and DB behind the API servers">
+    <figcaption><b>Figure 14-5</b> · The whole upload pipeline. Video bytes flow down the left (storage → transcoding → CDN); completion events flow right (queue → handler → metadata).</figcaption>
+  </figure>
+</section>
+<section class="cs-block" id="ch15"><h2><small>Chapter 15</small><a href="chapters/15-google-drive.html">Design Google Drive</a></h2>
+  
+  <ul>
+    <li><b>Scope:</b> upload, download, cross-device sync, revisions, sharing, notifications. Web + mobile, any file type, files ≤ <b>10 GB</b>, encrypted at rest, <b>10M DAU</b>.</li>
+    <li><b>Numbers:</b> 50M users × 10 GB = <b>500 PB</b> allocated. 2 uploads per user per day → <b>~240 upload QPS</b>, <b>480 at peak</b>.</li>
+    <li><b>Two paths:</b> metadata goes load balancer → API servers → metadata DB and cache. File content goes through <b>block servers</b> to cloud storage (S3, replicated across regions), with cold storage for inactive files.</li>
+    <li><b>Block servers</b> split files into blocks of up to <b>4 MB</b>, compress and encrypt each one, and use <b>delta sync</b> to upload only the blocks that changed.</li>
+    <li><b>Strong consistency:</b> a relational DB (native ACID), plus cache invalidation on every DB write.</li>
+    <li><b>Conflicts:</b> first version processed wins; the other user gets both copies to merge or override.</li>
+    <li><b>Notifications</b> use <b>long polling</b> (one-way, infrequent). An offline backup queue holds changes for offline clients.</li>
+    <li><b>Save space:</b> dedup blocks by hash, cap and thin out versions, move cold data to S3 Glacier.</li>
+  </ul>
+  <figure class="fig">
+    <img src="assets/img/p-253-220.jpg" alt="High-level design: user, block servers, cloud storage, cold storage, load balancer, API servers, metadata cache, metadata DB, notification service with long polling, offline backup queue">
+    <figcaption><b>Figure 15-10</b> · The final design. Content flows left (block servers → cloud storage); metadata flows down the middle (API servers → cache and DB); notifications flow right.</figcaption>
+  </figure>
+</section>
+<section class="cs-block" id="ch16"><h2><small>Chapter 16</small><a href="chapters/16-learning-continues.html">The Learning Continues</a></h2>
+  
+  <ul>
+    <li>Good design sense takes years to build. The shortcut is studying <b>real-world architectures</b>.</li>
+    <li>While reading, notice both the <b>shared principles</b> (caching, replication, sharding, queues, denormalization) and the <b>underlying technologies</b>. For each technology, ask <i>what problem does it solve?</i></li>
+    <li>Interviewing with a company? <b>Read its engineering blog</b> first, so you know the systems and technologies it uses.</li>
+    <li>Must-reads that map straight onto this book: <b>Dynamo</b> (Ch 6), <b>Snowflake</b> (Ch 7), <b>Timelines at Scale</b> (Ch 11), <b>Facebook Chat / WhatsApp</b> (Ch 12), <b>Haystack</b> (Ch 14), <b>Google File System</b> and <b>Dropbox</b> (Ch 15).</li>
+    <li>Practice makes perfect: re-run the <a href="flashcards.html">flashcards</a> and the <a href="chapters/16-learning-continues.html#self-test">final review</a> until the answers come without thinking.</li>
+  </ul>
+</section>
+</main>
+<script src="assets/chapters.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>

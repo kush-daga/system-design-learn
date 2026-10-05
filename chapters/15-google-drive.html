@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 15 · Design Google Drive — SDI Fast Track</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem("sdi:theme");if(t)document.documentElement.dataset.theme=JSON.parse(t)}catch(e){}</script>
+</head>
+<body data-root=".." data-chapter="15">
+<main id="content" class="chapter">
+
+<header class="chapter-hero">
+  <p class="eyebrow">Chapter 15 · Design problem</p>
+  <h1>Design Google Drive</h1>
+  <p class="lede">How to store, sync and version files for 10 million daily users: split files into 4 MB blocks, upload only the blocks that change, keep metadata strongly consistent in a relational database, and tell every device about changes with long polling.</p>
+  <div class="meta-row"></div>
+  <ul class="pace">
+    <li><a href="#tldr">⚡ TL;DR <small>2 min</small></a></li>
+    <li><a href="#skeleton">🗣 Interview answer <small>3 min</small></a></li>
+    <li><a href="#step-1">📖 Full walkthrough</a></li>
+    <li><a href="#self-test">🧠 Self-test</a></li>
+  </ul>
+</header>
+
+<section id="tldr" class="tldr">
+  <h2>TL;DR</h2>
+  <ul>
+    <li><b>Scope:</b> upload, download, cross-device sync, revisions, sharing, notifications. Web + mobile, any file type, files ≤ <b>10 GB</b>, encrypted at rest, <b>10M DAU</b>.</li>
+    <li><b>Numbers:</b> 50M users × 10 GB = <b>500 PB</b> allocated. 2 uploads per user per day → <b>~240 upload QPS</b>, <b>480 at peak</b>.</li>
+    <li><b>Two paths:</b> metadata goes load balancer → API servers → metadata DB and cache. File content goes through <b>block servers</b> to cloud storage (S3, replicated across regions), with cold storage for inactive files.</li>
+    <li><b>Block servers</b> split files into blocks of up to <b>4 MB</b>, compress and encrypt each one, and use <b>delta sync</b> to upload only the blocks that changed.</li>
+    <li><b>Strong consistency:</b> a relational DB (native ACID), plus cache invalidation on every DB write.</li>
+    <li><b>Conflicts:</b> first version processed wins; the other user gets both copies to merge or override.</li>
+    <li><b>Notifications</b> use <b>long polling</b> (one-way, infrequent). An offline backup queue holds changes for offline clients.</li>
+    <li><b>Save space:</b> dedup blocks by hash, cap and thin out versions, move cold data to S3 Glacier.</li>
+  </ul>
+  <figure class="fig">
+    <img src="../assets/img/p-253-220.jpg" alt="High-level design: user, block servers, cloud storage, cold storage, load balancer, API servers, metadata cache, metadata DB, notification service with long polling, offline backup queue">
+    <figcaption><b>Figure 15-10</b> · The final design. Content flows left (block servers → cloud storage); metadata flows down the middle (API servers → cache and DB); notifications flow right.</figcaption>
+  </figure>
+</section>
+
+<section id="skeleton">
+  <h2>Interview answer skeleton</h2>
+  <p class="one-liner">If asked this in an interview, walk through these four beats. Each maps to a section below.</p>
+  <ol class="framework">
+    <li><b>Clarify (≈5 min)</b> Ask about features (upload/download, sync, notifications), platforms (web + mobile), file types, encryption, size limit (10 GB) and scale (10M DAU). State the non-functional goals: reliability, fast sync, low bandwidth, scalability, availability. Estimate 500 PB and ~240 / 480 upload QPS.</li>
+    <li><b>High level (≈15 min)</b> Start with one server, give the three APIs, then scale: shard by <code>user_id</code>, move files to S3 with replication, add a load balancer and a separate metadata DB. Draw Figure 15-10 and explain first-version-wins conflicts.</li>
+    <li><b>Deep dive (≈20 min)</b> Block servers (4 MB blocks, compress, encrypt, delta sync). Strong consistency with a relational DB. The schema. Upload and download flows. Long polling. Saving storage. Failure handling.</li>
+    <li><b>Wrap up (≈5 min)</b> Uploading straight to cloud storage vs via block servers, and a separate presence service.</li>
+  </ol>
+</section>
+
+<section id="step-1">
+  <h2><span class="step-num">Step 1</span>Understand the problem and establish design scope</h2>
+  <p class="one-liner">Google Drive is a big product, so <b>narrow the scope first</b>: which features, what scale, and which non-functional requirements matter most.</p>
+  <p><b>Google Drive</b> is a file storage and synchronization service: store documents, photos and videos in the cloud, reach them from any computer, phone or tablet, and share them. Dropbox, OneDrive and iCloud are similar.</p>
+  <table class="qa-table">
+    <tr><th>You ask</th><th>Interviewer says</th></tr>
+    <tr><td>What are the most important features?</td><td>Upload and download files, file sync, and notifications.</td></tr>
+    <tr><td>Mobile app, web app, or both?</td><td>Both.</td></tr>
+    <tr><td>Which file formats are supported?</td><td>Any file type.</td></tr>
+    <tr><td>Do files need to be encrypted?</td><td>Yes, files in storage must be encrypted.</td></tr>
+    <tr><td>Is there a file size limit?</td><td>Yes, files must be 10 GB or smaller.</td></tr>
+    <tr><td>How many users does the product have?</td><td>10M DAU.</td></tr>
+  </table>
+
+  <h4>Features in scope</h4>
+  <ul class="checklist">
+    <li><b>Add files.</b> The easiest way is to drag and drop a file into Google Drive.</li>
+    <li><b>Download files.</b></li>
+    <li><b>Sync files across multiple devices.</b> A file added on one device is automatically synced to the others.</li>
+    <li><b>See file revisions.</b></li>
+    <li><b>Share files</b> with friends, family and coworkers.</li>
+    <li><b>Send a notification</b> when a file is edited, deleted, or shared with you.</li>
+  </ul>
+  <p><b>Out of scope:</b> Google Docs editing and collaboration, where several people edit the same document at the same time.</p>
+
+  <h4>Non-functional requirements</h4>
+  <table>
+    <tr><th>Requirement</th><th>Why it matters</th></tr>
+    <tr><td><b>Reliability</b></td><td>Extremely important for a storage system. Data loss is unacceptable.</td></tr>
+    <tr><td><b>Fast sync speed</b></td><td>If sync takes too long, users get impatient and abandon the product.</td></tr>
+    <tr><td><b>Bandwidth usage</b></td><td>Unnecessary network traffic makes users unhappy, especially on a mobile data plan.</td></tr>
+    <tr><td><b>Scalability</b></td><td>The system must handle high volumes of traffic.</td></tr>
+    <tr><td><b>High availability</b></td><td>Users can keep working when some servers are offline, slowed down, or hit unexpected network errors.</td></tr>
+  </table>
+
+  <h3>Back-of-the-envelope estimation</h3>
+  <h4>Assumptions</h4>
+  <ul>
+    <li><b>50 million</b> signed-up users and <b>10 million DAU</b>.</li>
+    <li>Each user gets <b>10 GB</b> of free space.</li>
+    <li>Users upload <b>2 files per day</b>; the average file size is <b>500 KB</b>.</li>
+    <li>Read-to-write ratio is <b>1:1</b>.</li>
+  </ul>
+  <div class="stats">
+    <div class="stat"><b>500 PB</b><span>total space allocated</span></div>
+    <div class="stat"><b>~240</b><span>upload QPS</span></div>
+    <div class="stat"><b>480</b><span>peak upload QPS</span></div>
+  </div>
+  <pre><code>Total space allocated = 50 million × 10 GB              = 500 PB
+Upload QPS            = 10 million × 2 / 24 h / 3600 s  ≈ 240
+Peak QPS              = QPS × 2                         = 480</code></pre>
+  <p>Exactly, 20,000,000 / 86,400 ≈ 231; the book rounds to ~240. Not in the book but easy to derive: new uploads add 10M × 2 × 500 KB = <b>10 TB per day</b>.</p>
+</section>
+
+<section id="step-2">
+  <h2><span class="step-num">Step 2</span>Propose high-level design</h2>
+  <p class="one-liner">Start with <b>everything on one server</b>, then fix each problem as it appears until you reach the final design.</p>
+
+  <h3>Start with a single server</h3>
+  <ul>
+    <li>A <b>web server</b> to upload and download files (Apache).</li>
+    <li>A <b>database</b> for metadata such as user data, login info and file info (MySQL).</li>
+    <li>A <b>storage system</b> for the files, with <b>1 TB</b> of space.</li>
+  </ul>
+  <p>Uploaded files live under a root directory, <code>drive/</code>. Each directory inside it is a <b>namespace</b>, holding all the uploaded files of one user. Files keep their original filename on the server. A file or folder is uniquely identified by <b>joining its namespace and relative path</b>.</p>
+  <p><b>Figure 15-3</b>, transcribed: the <code>drive/</code> directory, expanded.</p>
+  <pre><code>drive/
+├── user1/
+│   ├── recipes/
+│   └── chicken_soup.txt
+├── user2/
+│   ├── football.mov
+│   └── sports.txt
+└── user3/
+    └── best_pic_ever.png</code></pre>
+
+  <h3>APIs</h3>
+  <p>You need three APIs. All of them require <b>user authentication</b> and use <b>HTTPS</b>: SSL (Secure Sockets Layer) protects data moving between the client and backend servers. Endpoints are on <code>https://api.example.com</code>.</p>
+  <table>
+    <tr><th>API</th><th>Endpoint</th><th>Params</th></tr>
+    <tr><td><b>Upload a file</b></td><td><code>/files/upload?uploadType=resumable</code></td><td><code>uploadType=resumable</code>; <code>data</code>: the local file to upload</td></tr>
+    <tr><td><b>Download a file</b></td><td><code>/files/download</code></td><td><code>path</code>: path of the file to download</td></tr>
+    <tr><td><b>Get file revisions</b></td><td><code>/files/list_revisions</code></td><td><code>path</code>: the file whose revision history you want; <code>limit</code>: the maximum number of revisions to return</td></tr>
+  </table>
+  <pre><code>// download params
+{
+  "path": "/recipes/soup/best_soup.txt"
+}
+
+// list_revisions params
+{
+  "path": "/recipes/soup/best_soup.txt",
+  "limit": 20
+}</code></pre>
+  <h4>Two upload types</h4>
+  <ul>
+    <li><b>Simple upload:</b> for small files.</li>
+    <li><b>Resumable upload:</b> for large files when there's a high chance of network interruption.</li>
+  </ul>
+  <p>A resumable upload takes three steps:</p>
+  <ol class="flow">
+    <li>Send the initial request to retrieve the <b>resumable URL</b>.</li>
+    <li>Upload the data and monitor the upload state.</li>
+    <li>If the upload is disturbed, resume it.</li>
+  </ol>
+  <aside class="callout note">
+    <span class="callout-label">Beyond the book</span>
+    <p>In the real Google Drive API, step 1 returns a session URI. To resume, the client sends an empty <code>PUT</code> with <code>Content-Range: bytes */TOTAL</code>. The server answers <code>308 Resume Incomplete</code> with a <code>Range</code> header listing the bytes it has, and the client continues from there.</p>
+  </aside>
+
+  <h3>Move away from a single server</h3>
+  <p>As uploads grow, you get a space-full alert: the <code>/drive</code> volume shows <b>10 MB free of 1 TB</b> (Figure 15-4). Users can't upload any more, so this is an emergency.</p>
+
+  <h4>Fix 1 · Shard the data</h4>
+  <p>Spread files over multiple storage servers, sharded by <code>user_id</code>.</p>
+  <figure class="fig small">
+    <img src="../assets/img/p-250-215.jpg" alt="user_id % 4 routes each user to one of four servers">
+    <figcaption><b>Figure 15-5</b> · <code>user_id % 4</code> picks one of four servers, so each user's files live on one server.</figcaption>
+  </figure>
+  <p>That stops the fire, but a storage-server outage could still lose data.</p>
+
+  <h4>Fix 2 · Move files to Amazon S3</h4>
+  <p>Leading companies such as Netflix and Airbnb store files in <b>Amazon S3</b> (Simple Storage Service), an object storage service known for scalability, availability, security and performance. S3 supports <b>same-region</b> and <b>cross-region replication</b>. A <b>region</b> is a geographic area with AWS data centers; a <b>bucket</b> is like a folder. Copies in several regions guard against data loss and keep files available.</p>
+  <figure class="fig">
+    <img src="../assets/img/p-250-216.jpg" alt="Same-region replication copies a bucket within region A; cross-region replication copies it from region A to region B">
+    <figcaption><b>Figure 15-6</b> · Left: copies stay inside Region A. Right: copies go to Region B, so files survive the loss of Region A.</figcaption>
+  </figure>
+
+  <h4>Fix 3 · Decouple the rest</h4>
+  <table>
+    <tr><th>Change</th><th>Why</th></tr>
+    <tr><td><b>Add a load balancer</b></td><td>Distributes network traffic evenly. If a web server goes down, it redistributes that server's traffic.</td></tr>
+    <tr><td><b>Add web servers</b></td><td>Behind a load balancer, web servers can be added or removed easily as traffic changes.</td></tr>
+    <tr><td><b>Move the metadata DB off the server</b></td><td>Avoids a single point of failure. Add replication and sharding to meet the availability and scalability requirements.</td></tr>
+    <tr><td><b>Store files in S3</b></td><td>Files are replicated in two separate geographical regions for availability and durability.</td></tr>
+  </table>
+  <figure class="fig small">
+    <img src="../assets/img/p-251-217.jpg" alt="User (web browser, mobile app) to load balancer to API servers, which use a metadata DB and file storage">
+    <figcaption><b>Figure 15-7</b> · Web servers (now API servers), metadata DB and file storage are no longer on one box.</figcaption>
+  </figure>
+
+  <h3>Sync conflicts</h3>
+  <p>In a large storage system, two users sometimes modify the same file or folder at the same time. The rule: <b>the first version processed wins</b>, and the version processed later gets a <b>sync conflict</b>.</p>
+  <figure class="fig">
+    <img src="../assets/img/p-252-218.jpg" alt="Users 1 and 2 both send updates; user 1 is synced first; user 2 receives a conflict">
+    <figcaption><b>Figure 15-8</b> · Both users update at once. User 1's update is processed first and syncs; user 2 gets a conflict.</figcaption>
+  </figure>
+  <p>To resolve it, the system shows user 2 <b>both copies</b>: their local copy and the latest version from the server. User 2 can <b>merge</b> the two files or <b>override</b> one version with the other. <b>Figure 15-9</b>, transcribed:</p>
+  <pre><code>SystemDesignInterview                                      ← latest version on the server
+⚠ SystemDesignInterview_user 2_conflicted_copy_2019-05-01  ← user 2's local copy</code></pre>
+  <p>Syncing one document that several users edit simultaneously is a harder problem; see <b>differential synchronization</b> in the references.</p>
+
+  <h3>The high-level design</h3>
+  <figure class="fig">
+    <img src="../assets/img/p-253-220.jpg" alt="High-level design with block servers, cloud storage, cold storage, load balancer, API servers, metadata cache and DB, notification service and offline backup queue">
+    <figcaption><b>Figure 15-10</b> · The user talks to three things directly: block servers (content), the load balancer (metadata) and the notification service (long polling). The arrow from cloud storage to the load balancer is the upload-completion callback.</figcaption>
+  </figure>
+  <table>
+    <tr><th>Component</th><th>Role</th></tr>
+    <tr><td><b>User</b></td><td>Uses the app through a browser or mobile app.</td></tr>
+    <tr><td><b>Block servers</b></td><td>Upload blocks to cloud storage (<b>block-level storage</b>). A file is split into blocks, each with a <b>unique hash</b> stored in the metadata DB. Each block is an independent object in S3, and a file is rebuilt by joining its blocks in order. Maximum block size is <b>4 MB</b>, following Dropbox.</td></tr>
+    <tr><td><b>Cloud storage</b></td><td>Stores files as smaller blocks.</td></tr>
+    <tr><td><b>Cold storage</b></td><td>Stores inactive data: files not accessed for a long time.</td></tr>
+    <tr><td><b>Load balancer</b></td><td>Evenly distributes requests among API servers.</td></tr>
+    <tr><td><b>API servers</b></td><td>Almost everything except the upload flow: user authentication, user profiles, updating file metadata, and so on.</td></tr>
+    <tr><td><b>Metadata database</b></td><td>Metadata of users, files, blocks, versions, etc. Files themselves are in the cloud; this DB only has metadata.</td></tr>
+    <tr><td><b>Metadata cache</b></td><td>Caches some metadata for fast retrieval.</td></tr>
+    <tr><td><b>Notification service</b></td><td>A <b>publisher/subscriber</b> system. When a file is added, edited or removed elsewhere, it notifies the relevant clients so they can pull the latest changes.</td></tr>
+    <tr><td><b>Offline backup queue</b></td><td>If a client is offline and can't pull changes, the queue stores the info so the changes sync when the client is back online.</td></tr>
+  </table>
+  <aside class="callout key">
+    <span class="callout-label">Key idea</span>
+    <p>The design has <b>two flows</b>: <b>file sync</b> (block servers ↔ cloud storage) and <b>file metadata</b> (API servers ↔ metadata DB and cache). The notification service ties them together by telling clients when to pull.</p>
+  </aside>
+</section>
+
+<section id="step-3">
+  <h2><span class="step-num">Step 3</span>Design deep dive</h2>
+  <p class="one-liner">Seven topics: <b>block servers, metadata DB, upload flow, download flow, notification service, saving storage space, failure handling</b>.</p>
+
+  <h3>Block servers</h3>
+  <p>For large files that change often, sending the whole file on every update wastes bandwidth. Two optimizations cut network traffic:</p>
+  <ul>
+    <li><b>Delta sync.</b> When a file is modified, only the modified blocks are synced, not the whole file, using a sync algorithm (rsync-style).</li>
+    <li><b>Compression.</b> Compressing blocks greatly reduces their size. The algorithm depends on file type: <b>gzip</b> and <b>bzip2</b> for text; images and videos need different algorithms.</li>
+  </ul>
+  <p>Block servers do the heavy lifting for uploads. For a new file:</p>
+  <ol class="flow">
+    <li>Split the file into smaller blocks (up to 4 MB each).</li>
+    <li>Compress each block.</li>
+    <li>Encrypt each block, for security, before it goes to cloud storage.</li>
+    <li>Upload the blocks to cloud storage.</li>
+  </ol>
+  <figure class="fig">
+    <img src="../assets/img/p-255-221.jpg" alt="Inside block servers, a file is split into blocks 1 to N, each compressed then encrypted, then sent to cloud storage">
+    <figcaption><b>Figure 15-11</b> · Every block goes through the same pipeline: split → compress → encrypt → cloud storage.</figcaption>
+  </figure>
+  <p>On later edits, only modified blocks are transferred. In Figure 15-12, blocks 2 and 5 changed, so only those two are uploaded.</p>
+  <figure class="fig medium">
+    <img src="../assets/img/p-256-222.jpg" alt="Ten blocks on the block servers; only the changed blocks 2 and 5 go to cloud storage">
+    <figcaption><b>Figure 15-12</b> · Delta sync: of 10 blocks, only the 2 highlighted (changed) ones travel.</figcaption>
+  </figure>
+
+  <div class="demo" id="ds-demo">
+    <span class="demo-title">Try it · Delta sync with fixed-size blocks</span>
+    <p style="font-size:15px;margin-bottom:10px">Each 8-character block stands in for a 4 MB block. Version 1 is already in cloud storage, and only blocks whose hash isn't already stored get uploaded. Edit version 2, then try typing one character at the very start.</p>
+    <div style="display:grid;gap:8px;margin-bottom:12px">
+      <label>Version 1 (in cloud storage)<br><input id="ds-old" style="width:100%" value="Monday: gym 7am, email, lunch w/ Sam at 1pm, code review at 3pm, dinner at 8pm."></label>
+      <label>Version 2 (edited on a device)<br><input id="ds-new" style="width:100%" value="Monday: gym 6am, email, lunch w/ Ana at 1pm, code review at 3pm, dinner at 8pm."></label>
+      <label>Block size <select id="ds-size"><option>4</option><option selected>8</option><option>16</option></select> characters</label>
+    </div>
+    <div class="out" id="ds-out"></div>
+  </div>
+  <aside class="callout note">
+    <span class="callout-label">Beyond the book</span>
+    <p>Comparing block hashes handles in-place edits. With fixed-size blocks, though, inserting one byte near the start shifts every later boundary, so every block looks new (try it above). <b>rsync</b> fixes this with a cheap <b>rolling checksum</b> that finds matching blocks at any byte offset, confirmed by a strong hash. <b>Content-defined chunking</b> instead sets boundaries by content, so an insert only changes nearby blocks.</p>
+  </aside>
+
+  <h3>High consistency requirement</h3>
+  <p>The system needs <b>strong consistency</b> by default: a file must never look different to different clients at the same time. This applies to both the <b>metadata cache</b> and the <b>database</b> layers.</p>
+  <p>Memory caches use <b>eventual consistency</b> by default, so different replicas might hold different data. To make the cache strongly consistent:</p>
+  <ul>
+    <li>Keep data in the cache replicas and the master consistent.</li>
+    <li><b>Invalidate caches on database writes</b>, so the cache and the database hold the same value.</li>
+  </ul>
+  <p>A <b>relational database</b> makes strong consistency easy because it maintains <b>ACID</b> (Atomicity, Consistency, Isolation, Durability). NoSQL databases don't support ACID by default, so you would have to build it into the synchronization logic yourself. The design picks a relational database because ACID is supported natively.</p>
+
+  <h3>Metadata database</h3>
+  <p>A highly simplified schema with only the most important tables and fields:</p>
+  <figure class="fig">
+    <img src="../assets/img/p-257-223.jpg" alt="Schema: user, device, workspace, file, file_version and block tables with their columns and relationships">
+    <figcaption><b>Figure 15-13</b> · Follow the chain: user → workspace (namespace) → file → file_version → block. Each device links to the versions it created.</figcaption>
+  </figure>
+  <table>
+    <tr><th>Table</th><th>Columns (from the figure)</th><th>What it stores</th></tr>
+    <tr><td><b>user</b></td><td><code>user_id</code> bigint (PK), <code>user_name</code> varchar, <code>created_at</code> timestamp</td><td>Basic user info such as username, email and profile photo. One user has many devices and many namespaces.</td></tr>
+    <tr><td><b>device</b></td><td><code>device_id</code> uuid (PK), <code>user_id</code> bigint → user, <code>last_logged_in_at</code> timestamp</td><td>Device info; a user can have multiple devices. The text adds <code>push_id</code>, used to send and receive mobile push notifications.</td></tr>
+    <tr><td><b>namespace</b></td><td><code>id</code> bigint (PK), <code>owner_id</code> bigint → user, <code>is_shared</code> boolean, <code>created_at</code> timestamp</td><td>The <b>root directory</b> of a user. One namespace has many files.</td></tr>
+    <tr><td><b>file</b></td><td><code>id</code> bigint (PK), <code>file_name</code> varchar, <code>relative_path</code> varchar, <code>is_directory</code> boolean, <code>latest_version</code> bigint, <code>checksum</code> bigint, <code>workspace_id</code> bigint → namespace, <code>created_at</code> timestamp, <code>last_modified</code> timestamp</td><td>Everything about the <b>latest</b> file. One file has many versions.</td></tr>
+    <tr><td><b>file_version</b></td><td><code>id</code> bigint (PK), <code>file_id</code> bigint → file, <code>device_id</code> uuid → device, <code>version_number</code> bigint, <code>last_modified</code> timestamp</td><td>The version history of a file. Existing rows are <b>read-only</b> to keep the revision history intact. One version has many blocks.</td></tr>
+    <tr><td><b>block</b></td><td><code>block_id</code> bigint (PK), <code>file_version_id</code> bigint → file_version, <code>block_order</code> int</td><td>Everything about one block. Rebuild <b>any version</b> of a file by joining its blocks in the correct order.</td></tr>
+  </table>
+  <p>Figure quirks: the namespace table is labeled <code>workspace</code>, <code>latest_version</code> is misspelled <code>lastest_version</code>, device ↔ file_version is drawn 1-to-1 (a device can create many versions), and <code>push_id</code> and the block hash are missing.</p>
+
+  <h3>Upload flow</h3>
+  <p>Client 1 sends <b>two requests in parallel</b>: add the file's metadata, and upload the file's content to cloud storage.</p>
+  <figure class="fig">
+    <img src="../assets/img/p-258-224.jpg" alt="Sequence diagram of the upload flow across client 1, client 2, block servers, cloud storage, API servers, metadata DB and notification service">
+    <figcaption><b>Figure 15-14</b> · Steps 1–4 handle metadata; steps 2.1–2.6 move the content. The status goes from <b>pending</b> to <b>uploaded</b>.</figcaption>
+  </figure>
+  <table>
+    <tr><th>Step</th><th>What happens</th></tr>
+    <tr><th colspan="2">Request A · Add file metadata</th></tr>
+    <tr><td>1</td><td>Client 1 sends a request to API servers to add the new file's metadata.</td></tr>
+    <tr><td>2</td><td>The metadata is stored in the metadata DB, and the file's upload status is set to <b>"pending"</b>.</td></tr>
+    <tr><td>3</td><td>The notification service is told that a new file is being added.</td></tr>
+    <tr><td>4</td><td>The notification service tells relevant clients (client 2) that a file is being uploaded.</td></tr>
+    <tr><th colspan="2">Request B · Upload the file to cloud storage</th></tr>
+    <tr><td>2.1</td><td>Client 1 uploads the file content to block servers.</td></tr>
+    <tr><td>2.2</td><td>Block servers chunk the file into blocks, compress and encrypt them, and upload them to cloud storage.</td></tr>
+    <tr><td>2.3</td><td>When the upload finishes, cloud storage triggers an <b>upload completion callback</b> to API servers.</td></tr>
+    <tr><td>2.4</td><td>The file status is changed to <b>"uploaded"</b> in the metadata DB.</td></tr>
+    <tr><td>2.5</td><td>The notification service is told the status changed to "uploaded".</td></tr>
+    <tr><td>2.6</td><td>The notification service tells relevant clients (client 2) that the file is fully uploaded.</td></tr>
+  </table>
+  <p>Editing a file follows a similar flow.</p>
+
+  <h3>Download flow</h3>
+  <p>A download is triggered when a file is added or edited elsewhere. A client finds out in one of two ways:</p>
+  <ul>
+    <li><b>Online:</b> the notification service tells client A that changes were made somewhere and it needs to pull the latest data.</li>
+    <li><b>Offline:</b> the change info is saved, and client A pulls the latest changes when it is back online. (The book says "saved to the cache" here; in the high-level design that is the offline backup queue's job.)</li>
+  </ul>
+  <p>Once a client knows a file changed, it first requests <b>metadata</b> via API servers, then downloads <b>blocks</b> to rebuild the file.</p>
+  <figure class="fig">
+    <img src="../assets/img/p-259-225.jpg" alt="Sequence diagram of the download flow across client 2, block servers, cloud storage, API servers, metadata DB and notification service">
+    <figcaption><b>Figure 15-15</b> · Metadata first (steps 2–5), then blocks (steps 6–9). Only the key components are shown.</figcaption>
+  </figure>
+  <ol class="flow">
+    <li>The notification service tells client 2 that a file changed somewhere else.</li>
+    <li>Client 2 sends a request to API servers to fetch the metadata.</li>
+    <li>API servers ask the metadata DB for the metadata of the changes.</li>
+    <li>The metadata DB returns it to the API servers.</li>
+    <li>Client 2 receives the metadata.</li>
+    <li>Client 2 sends requests to block servers to download blocks.</li>
+    <li>Block servers download the blocks from cloud storage.</li>
+    <li>Cloud storage returns the blocks to block servers.</li>
+    <li>Client 2 downloads all the new blocks and reconstructs the file.</li>
+  </ol>
+
+  <h3>Notification service</h3>
+  <p>To keep files consistent, every local change must be announced to other clients to reduce conflicts. The notification service sends data to clients as events happen. Two options:</p>
+  <table>
+    <tr><th></th><th>Long polling</th><th>WebSocket</th></tr>
+    <tr><td><b>Connection</b></td><td>Client keeps a request open and re-opens it after each response or timeout</td><td>One persistent connection</td></tr>
+    <tr><td><b>Direction</b></td><td>Server → client is enough</td><td>Bi-directional</td></tr>
+    <tr><td><b>Best for</b></td><td>Infrequent events; <b>Dropbox uses it</b></td><td>Real-time two-way traffic, such as chat</td></tr>
+  </table>
+  <p>Both work, but the design picks <b>long polling</b> for two reasons: (1) communication isn't bi-directional, since the server sends file-change info to the client and never the reverse; (2) WebSocket suits real-time two-way traffic like chat, while Drive's notifications are infrequent, with no bursts of data.</p>
+  <h4>How long polling works here</h4>
+  <ol class="flow">
+    <li>Each client opens a long-poll connection to the notification service.</li>
+    <li>When a change to a file is detected, the long-poll connection is closed.</li>
+    <li>The client then connects to the metadata server to download the latest changes.</li>
+    <li>After a response arrives or the connection times out, the client immediately sends a new request to keep the connection open.</li>
+  </ol>
+
+  <h3>Save storage space</h3>
+  <p>To support version history and reliability, several versions of each file are stored across multiple data centers. Frequent backups of every revision fill storage quickly. Three techniques reduce the cost:</p>
+  <table>
+    <tr><th>Technique</th><th>How it works</th></tr>
+    <tr><td><b>De-duplicate data blocks</b></td><td>Remove redundant blocks at the <b>account level</b>. Two blocks are identical if they have the <b>same hash</b>.</td></tr>
+    <tr><td><b>Intelligent backup: set a limit</b></td><td>Cap the number of stored versions. When the limit is reached, the oldest version is replaced by the new one.</td></tr>
+    <tr><td><b>Intelligent backup: keep valuable versions only</b></td><td>A heavily edited document could be saved <b>over 1,000 times</b> in a short period. Limit the saved versions and give more weight to recent ones. Experiment to find the best number.</td></tr>
+    <tr><td><b>Move rarely used data to cold storage</b></td><td><b>Cold data</b> hasn't been active for months or years. Cold storage such as <b>Amazon S3 Glacier</b> is much cheaper than S3.</td></tr>
+  </table>
+
+  <h3>Failure handling</h3>
+  <p>An interviewer may ask how each component survives failure:</p>
+  <table>
+    <tr><th>Component</th><th>If it fails</th></tr>
+    <tr><td><b>Load balancer</b></td><td>The secondary becomes active and picks up the traffic. Load balancers watch each other with a <b>heartbeat</b>, a periodic signal; one is considered failed if it hasn't sent a heartbeat for some time.</td></tr>
+    <tr><td><b>Block server</b></td><td>Other block servers pick up its unfinished or pending jobs.</td></tr>
+    <tr><td><b>Cloud storage</b></td><td>S3 buckets are replicated multiple times in different regions. If files aren't available in one region, fetch them from another.</td></tr>
+    <tr><td><b>API server</b></td><td>It's stateless, so the load balancer redirects traffic to other API servers.</td></tr>
+    <tr><td><b>Metadata cache</b></td><td>Cache servers are replicated multiple times, so read from other nodes. Bring up a new cache server to replace the failed one.</td></tr>
+    <tr><td><b>Metadata DB · master</b></td><td>Promote one of the slaves (replicas) to be the new master, and bring up a new slave node.</td></tr>
+    <tr><td><b>Metadata DB · slave</b></td><td>Use another slave for reads, and bring up another database server to replace the failed one.</td></tr>
+    <tr><td><b>Notification service</b></td><td>Each online user holds a long-poll connection, so each server serves many users: <b>over 1 million open connections per machine</b> (Dropbox, 2012). If a server dies, all of them drop and clients must reconnect to another server. A server can't reconnect that many clients at once, so recovery is <b>relatively slow</b>.</td></tr>
+    <tr><td><b>Offline backup queue</b></td><td>Queues are replicated multiple times. If one fails, its consumers may need to re-subscribe to the backup queue.</td></tr>
+  </table>
+</section>
+
+<section id="step-4">
+  <h2><span class="step-num">Step 4</span>Wrap up</h2>
+  <p class="one-liner">The design is interesting because it combines <b>strong consistency, low network bandwidth and fast sync</b>.</p>
+  <p>It has two flows, <b>managing file metadata</b> and <b>file sync</b>, plus a notification service that uses long polling to keep clients up to date with file changes. There's no perfect design: every company has its own constraints, so know the trade-offs of your choices. With time left, discuss alternatives:</p>
+
+  <h3>Upload directly to cloud storage?</h3>
+  <p>The client could upload straight to cloud storage instead of going through block servers.</p>
+  <div class="pros-cons">
+    <div class="pros"><h4>Pros</h4><ul><li>Faster uploads: the file is transferred <b>once</b>, to cloud storage. In this design it goes to block servers first, then to cloud storage.</li></ul></div>
+    <div class="cons"><h4>Cons</h4><ul><li>Chunking, compression and encryption must be built for <b>every platform</b> (iOS, Android, web). That's error-prone and takes a lot of engineering effort; block servers keep it in one place.</li><li>A client can easily be hacked or manipulated, so client-side encryption logic is not ideal.</li></ul></div>
+  </div>
+  <aside class="callout tip">
+    <span class="callout-label">Say this in the interview</span>
+    <p>"I route uploads through block servers so chunking, compression and encryption live in one trusted place. The cost is an extra hop, which I'd revisit if upload speed became the main complaint."</p>
+  </aside>
+
+  <h3>A separate presence service</h3>
+  <p>Move the online/offline logic out of the notification servers into its own <b>presence service</b>. Then other services can easily use online/offline status too.</p>
+</section>
+
+<section id="self-test">
+  <h2>Self-test</h2>
+  <details class="qa"><summary>What are the functional and non-functional requirements?</summary><div><p>Functional: add (upload) and download files, sync across devices, see revisions, share files, and notify on edit, delete or share. Non-functional: reliability (no data loss), fast sync, low bandwidth use, scalability, high availability. Collaborative Google Docs editing is out of scope.</p></div></details>
+  <details class="qa"><summary>Walk through the back-of-the-envelope estimation.</summary><div><p>50M users × 10 GB = <b>500 PB</b> allocated. 10M DAU × 2 uploads / 86,400 s ≈ <b>240 upload QPS</b> (≈ 231 exactly). Peak = 2 × QPS = <b>480</b>.</p></div></details>
+  <details class="qa"><summary>What are the three APIs, and when do you use simple vs resumable upload?</summary><div><p><code>/files/upload</code> (<code>uploadType</code>, <code>data</code>), <code>/files/download</code> (<code>path</code>) and <code>/files/list_revisions</code> (<code>path</code>, <code>limit</code>), all authenticated over HTTPS. Simple upload is for small files. Resumable upload is for large files on unreliable networks: get a resumable URL, upload while monitoring state, and resume if disturbed.</p></div></details>
+  <details class="qa"><summary>Your single server is nearly full. What do you change, in order?</summary><div><p>Shard file storage by <code>user_id</code> across servers. Then, to avoid data loss, move files to Amazon S3 with same-region and cross-region replication. Finally, add a load balancer and more web servers, and move the metadata DB out (with replication and sharding).</p></div></details>
+  <details class="qa"><summary>How are sync conflicts resolved, and what does the losing user see?</summary><div><p>The first version processed wins; the later one gets a conflict. The system shows that user both copies (their local "conflicted copy" and the latest server version), and they can merge them or override one with the other.</p></div></details>
+  <details class="qa"><summary>What does a block server do with a new file, and what is the block size?</summary><div><p>It splits the file into blocks of up to <b>4 MB</b> (Dropbox's size), compresses each block, encrypts each block, and uploads the blocks to cloud storage.</p></div></details>
+  <details class="qa"><summary>Which two techniques cut bandwidth on updates?</summary><div><p><b>Delta sync</b>: only modified blocks are sent, not the whole file. <b>Compression</b>: blocks are compressed with an algorithm that suits the file type (e.g. gzip or bzip2 for text).</p></div></details>
+  <details class="qa"><summary>How do you get strong consistency for metadata, and why a relational DB?</summary><div><p>Keep cache replicas consistent with the master, and invalidate caches on every DB write. Use a relational DB because it supports ACID natively; NoSQL would need ACID built into the sync logic.</p></div></details>
+  <details class="qa"><summary>Name the metadata tables. How do you rebuild a specific version of a file?</summary><div><p>user, device, namespace (workspace), file, file_version and block. Join all the blocks of that <code>file_version</code> in <code>block_order</code>. Existing <code>file_version</code> rows are read-only.</p></div></details>
+  <details class="qa"><summary>Describe the two parallel requests in the upload flow.</summary><div><p>(A) Add metadata: API servers save it with status "pending" and the notification service tells other clients a file is being uploaded. (B) Upload content: client → block servers → cloud storage; a completion callback to API servers sets status "uploaded", and the notification service tells other clients the file is fully uploaded.</p></div></details>
+  <details class="qa"><summary>Walk through the download flow.</summary><div><p>The client is notified (or catches up when it comes back online), fetches the change metadata from API servers (which read the metadata DB), then downloads the new blocks via block servers (which fetch them from cloud storage) and reconstructs the file.</p></div></details>
+  <details class="qa"><summary>Why long polling rather than WebSocket for notifications?</summary><div><p>Notifications only flow server → client, and they're infrequent with no bursts. WebSocket's bi-directional, real-time connection suits apps like chat. Dropbox uses long polling.</p></div></details>
+  <details class="qa"><summary>Name three ways to save storage space.</summary><div><p>De-duplicate identical blocks (same hash) at the account level. Use an intelligent backup strategy: cap the number of versions and keep only valuable ones, weighting recent versions. Move cold data to cheaper cold storage such as S3 Glacier.</p></div></details>
+  <details class="qa"><summary>What happens when the metadata DB master fails, and when a notification server fails?</summary><div><p>DB master: promote a slave to master and add a new slave. Notification server: all its long-poll connections (over 1 million per machine, per Dropbox) drop, and clients must reconnect to other servers, which is relatively slow.</p></div></details>
+  <details class="qa"><summary>Why not have clients upload directly to cloud storage?</summary><div><p>It's faster (one transfer instead of two), but chunking, compression and encryption would have to be built for iOS, Android and web, which is error-prone and costly. Clients can also be hacked, so client-side encryption isn't ideal. Block servers centralize that logic.</p></div></details>
+</section>
+
+<section id="glossary">
+  <h2>Terms to know</h2>
+  <dl class="glossary">
+    <dt>Namespace</dt><dd>A user's root directory. A file is identified by its namespace plus relative path.</dd>
+    <dt>Block server</dt><dd>Server that splits files into blocks (≤ 4 MB), compresses and encrypts them, and moves them to and from cloud storage.</dd>
+    <dt>Delta sync</dt><dd>Syncing only the blocks that changed instead of the whole file.</dd>
+    <dt>Resumable upload</dt><dd>An upload that can continue from where it stopped after a network interruption.</dd>
+    <dt>Strong consistency</dt><dd>Every client sees the same data at the same time. Caches are eventually consistent by default.</dd>
+    <dt>ACID</dt><dd>Atomicity, Consistency, Isolation, Durability: transaction guarantees built into relational databases.</dd>
+    <dt>Cross-region replication</dt><dd>Copying S3 buckets to another geographic region, so files survive a regional outage.</dd>
+    <dt>Cold storage</dt><dd>Cheap storage for data that hasn't been active for months or years, e.g. Amazon S3 Glacier.</dd>
+    <dt>Long polling</dt><dd>The client holds a request open until the server has news or it times out, then immediately re-opens it.</dd>
+    <dt>Offline backup queue</dt><dd>Holds change info for offline clients so they can sync when they reconnect.</dd>
+    <dt>Presence service</dt><dd>A separate service that tracks which clients are online or offline.</dd>
+  </dl>
+  <details class="more refs"><summary>Book references (go deeper)</summary><div><ol>
+    <li><a href="https://www.google.com/drive/">Google Drive</a></li>
+    <li><a href="https://developers.google.com/drive/api/v2/manage-uploads">Upload file data (Google Drive API)</a></li>
+    <li><a href="https://aws.amazon.com/s3">Amazon S3</a></li>
+    <li><a href="https://neil.fraser.name/writing/sync/">Differential Synchronization</a></li>
+    <li><a href="https://www.youtube.com/watch?v=S2Hp_1jqpY8">Differential Synchronization (YouTube talk)</a></li>
+    <li><a href="https://youtu.be/PE4gwstWhmc">How We've Scaled Dropbox</a></li>
+    <li><a href="https://rsync.samba.org/tech_report/">Tridgell, A., &amp; Mackerras, P. (1996). The rsync algorithm</a></li>
+    <li><a href="https://github.com/librsync/librsync">librsync</a></li>
+    <li><a href="https://en.wikipedia.org/wiki/ACID">ACID</a></li>
+    <li><a href="https://www.dropbox.com/static/business/resources/Security_Whitepaper.pdf">Dropbox security white paper</a></li>
+    <li><a href="https://aws.amazon.com/glacier/faqs/">Amazon S3 Glacier FAQs</a></li>
+  </ol></div></details>
+</section>
+
+</main>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  function fnv(s) {
+    var h = 0x811c9dc5;
+    for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+    return ("0000000" + h.toString(16)).slice(-8);
+  }
+  function split(s, n) { var out = []; for (var i = 0; i < s.length; i += n) out.push(s.slice(i, i + n)); return out; }
+  function esc(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/ /g, "·"); }
+  function run() {
+    var n = parseInt($("ds-size").value, 10), stored = {}, sent = 0, sentChars = 0, html = [];
+    split($("ds-old").value, n).forEach(function (b) { stored[fnv(b)] = true; });
+    var text = $("ds-new").value, blocks = split(text, n);
+    blocks.forEach(function (b, i) {
+      var h = fnv(b), isNew = !stored[h];
+      if (isNew) { stored[h] = true; sent++; sentChars += b.length; }
+      html.push('<span style="display:inline-block;margin:3px;padding:4px 8px;border-radius:6px;border:1px solid ' +
+        (isNew ? "var(--accent);background:var(--accent-tint);color:var(--ink)" : "var(--line);background:var(--surface-2);color:var(--ink-3)") +
+        '"><small>#' + (i + 1) + " · " + h.slice(0, 6) + "</small><br>" + esc(b) + "</span>");
+    });
+    var pct = text.length ? Math.round(100 * sentChars / text.length) : 0;
+    $("ds-out").innerHTML = html.join("") +
+      '<p style="margin:10px 0 0">Highlighted = uploaded, grey = already stored. Upload <b>' + sent + " of " + blocks.length +
+      "</b> blocks (" + sentChars + " of " + text.length + " characters, " + pct + "%). Without delta sync: all " + blocks.length + ".</p>";
+  }
+  $("ds-old").addEventListener("input", run);
+  $("ds-new").addEventListener("input", run);
+  $("ds-size").addEventListener("change", run);
+  run();
+})();
+</script>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

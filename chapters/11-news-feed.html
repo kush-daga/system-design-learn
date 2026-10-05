@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 11 · Design a News Feed System — SDI Fast Track</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem("sdi:theme");if(t)document.documentElement.dataset.theme=JSON.parse(t)}catch(e){}</script>
+</head>
+<body data-root=".." data-chapter="11">
+<main id="content" class="chapter">
+
+<header class="chapter-hero">
+  <p class="eyebrow">Chapter 11 · Design problem</p>
+  <h1>Design a News Feed System</h1>
+  <p class="lede">How a new post reaches up to 5,000 friends' feeds: the publishing and retrieval flows, fanout on write vs fanout on read (and the hybrid that handles celebrities), and the five-layer cache that keeps feeds fast.</p>
+  <div class="meta-row"></div>
+  <ul class="pace">
+    <li><a href="#tldr">⚡ TL;DR <small>2 min</small></a></li>
+    <li><a href="#skeleton">🗣 Interview answer <small>3 min</small></a></li>
+    <li><a href="#step-1">📖 Full walkthrough</a></li>
+    <li><a href="#self-test">🧠 Self-test</a></li>
+  </ul>
+</header>
+
+<section id="tldr" class="tldr">
+  <h2>TL;DR</h2>
+  <ul>
+    <li><b>Scope:</b> web + mobile; publish posts and see friends' posts, <b>reverse chronological</b>; up to <b>5,000 friends</b>; <b>10M DAU</b>; posts can include images and videos.</li>
+    <li><b>APIs:</b> <code>POST /v1/me/feed</code> (<code>content</code>, <code>auth_token</code>) publishes; <code>GET /v1/me/feed</code> (<code>auth_token</code>) retrieves.</li>
+    <li><b>Publish:</b> web servers (auth + rate limit) → <b>post service</b> (post DB + cache), <b>fanout service</b> (into friends' feed caches), <b>notification service</b>.</li>
+    <li><b>Fanout on write (push):</b> fast reads, but slow for users with many friends (<b>hotkey problem</b>) and wasted on inactive users. <b>Fanout on read (pull):</b> no waste, no hotkey, but slow reads.</li>
+    <li><b>Hybrid:</b> push for most users; for <b>celebrities</b>, followers pull on demand. Consistent hashing spreads hotkeys.</li>
+    <li><b>Fanout steps:</b> friend IDs from a <b>graph DB</b> → filter by settings via user cache → <b>message queue</b> → <b>fanout workers</b> → feed cache stores only <code>&lt;post_id, user_id&gt;</code>, capped.</li>
+    <li><b>Retrieve:</b> post IDs from the feed cache, <b>hydrate</b> from user and post caches, return JSON. Media comes from a <b>CDN</b>.</li>
+    <li><b>Cache layers:</b> news feed, content, social graph, action, counters.</li>
+  </ul>
+  <figure class="fig">
+    <img src="../assets/img/p-171-140.jpg" alt="Feed publishing design: user, load balancer, web servers with authentication and rate limiting, post service with post cache and DB, notification service, and fanout service that reads the graph DB and user cache, writes to a message queue, and fanout workers that write the news feed cache">
+    <figcaption><b>Figure 11-4</b> · The publishing path. Follow the fanout service's numbered steps 1–5: graph DB → user cache → queue → workers → news feed cache.</figcaption>
+  </figure>
+</section>
+
+<section id="skeleton">
+  <h2>Interview answer skeleton</h2>
+  <p class="one-liner">If asked this in an interview, walk through these four beats. Each maps to a section below.</p>
+  <ol class="framework">
+    <li><b>Clarify (≈5 min)</b> Web, mobile or both? Key features? Feed order? Max friends (5,000)? Traffic (10M DAU)? Media (images and videos)?</li>
+    <li><b>High-level (≈15 min)</b> Split into feed publishing and news feed building. Define the two APIs. Draw both flows: load balancer, web servers, post/fanout/notification services, news feed service, caches.</li>
+    <li><b>Deep dive (≈15 min)</b> Auth and rate limiting at the web tier. Fanout on write vs read and the hybrid for celebrities. The fanout service's five steps. Retrieval's six steps with hydration and CDN. The five cache layers.</li>
+    <li><b>Wrap up (≈5 min)</b> Scaling the DB (vertical/horizontal, SQL/NoSQL, replication, read replicas, consistency, sharding), stateless web tier, caching, multiple data centers, message queues, key metrics.</li>
+  </ol>
+</section>
+
+<section id="step-1">
+  <h2><span class="step-num">Step 1</span>Understand the problem</h2>
+  <p class="one-liner">At minimum, settle <b>which features to support</b>, the <b>feed order</b>, and the <b>scale</b>.</p>
+  <p>Facebook defines the <b>news feed</b> as the constantly updating list of stories in the middle of your home page: status updates, photos, videos, links, app activity, and likes from people, pages and groups you follow. Similar questions: design the Facebook news feed, Instagram feed, or Twitter timeline.</p>
+  <table class="qa-table">
+    <tr><th>You ask</th><th>Interviewer says</th></tr>
+    <tr><td>Is this a mobile app, a web app, or both?</td><td>Both.</td></tr>
+    <tr><td>What are the important features?</td><td>A user can publish a post and see friends' posts on the news feed page.</td></tr>
+    <tr><td>Is the feed sorted in reverse chronological order, or by something like topic scores (e.g. close friends' posts score higher)?</td><td>To keep it simple, <b>reverse chronological order</b>.</td></tr>
+    <tr><td>How many friends can a user have?</td><td><b>5,000.</b></td></tr>
+    <tr><td>What is the traffic volume?</td><td><b>10 million DAU</b> (daily active users).</td></tr>
+    <tr><td>Can the feed contain images, videos, or just text?</td><td>Media files, including both <b>images and videos</b>.</td></tr>
+  </table>
+  <div class="stats">
+    <div class="stat"><b>10M</b><span>daily active users</span></div>
+    <div class="stat"><b>5,000</b><span>max friends per user</span></div>
+    <div class="stat"><b>Newest first</b><span>reverse chronological feed</span></div>
+  </div>
+</section>
+
+<section id="step-2">
+  <h2><span class="step-num">Step 2</span>High-level design</h2>
+  <p class="one-liner">Split the system into two flows: <b>feed publishing</b> (write) and <b>news feed building</b> (read).</p>
+  <ul>
+    <li><b>Feed publishing:</b> when a user publishes a post, the data is written to cache and database, and the post is populated to friends' news feeds.</li>
+    <li><b>News feed building:</b> the feed is built by aggregating friends' posts in reverse chronological order.</li>
+  </ul>
+
+  <h3>News feed APIs</h3>
+  <p>Clients talk to servers over HTTP-based APIs for posting a status, retrieving the feed, adding friends, etc. The two most important:</p>
+  <table>
+    <tr><th>API</th><th>Purpose</th><th>Params</th></tr>
+    <tr><td><code>POST /v1/me/feed</code></td><td>Publish a post</td><td><code>content</code>: the text of the post<br><code>auth_token</code>: authenticates the request</td></tr>
+    <tr><td><code>GET /v1/me/feed</code></td><td>Retrieve the news feed</td><td><code>auth_token</code>: authenticates the request</td></tr>
+  </table>
+  <aside class="callout note">
+    <span class="callout-label">Beyond the book</span>
+    <p>The book's figures pass <code>auth_token</code> in the query string. In practice send it in an <code>Authorization</code> header, because URLs end up in server logs, browser history and proxies. Feed retrieval is also usually <b>paginated with a cursor</b>: the client sends the last post ID it has and gets the next page of older posts. Offset-based pages shift as new posts arrive at the top.</p>
+  </aside>
+
+  <p>The two flows side by side:</p>
+  <div class="fig-row">
+    <figure class="fig">
+      <img src="../assets/img/p-169-138.jpg" alt="Feed publishing high-level design: user, DNS, load balancer, web servers, then post service with post cache and post DB, fanout service with news feed cache, and notification service">
+      <figcaption><b>Figure 11-2</b> · Publishing: web servers call three services. Only the fanout service writes to the news feed cache.</figcaption>
+    </figure>
+    <figure class="fig">
+      <img src="../assets/img/p-170-139.jpg" alt="News feed building high-level design: user, DNS, load balancer, web servers, news feed service, news feed cache">
+      <figcaption><b>Figure 11-3</b> · Building: one straight line from user to news feed cache.</figcaption>
+    </figure>
+  </div>
+
+  <h3>Feed publishing</h3>
+  <table>
+    <tr><th>Component</th><th>Role in publishing (Figure 11-2)</th></tr>
+    <tr><td><b>User</b></td><td>Views feeds in a browser or mobile app. Posts "Hello" via <code>/v1/me/feed?content=Hello&amp;auth_token={auth_token}</code>.</td></tr>
+    <tr><td><b>Load balancer</b></td><td>Distributes traffic to web servers.</td></tr>
+    <tr><td><b>Web servers</b></td><td>Redirect traffic to the internal services.</td></tr>
+    <tr><td><b>Post service</b></td><td>Persists the post in the database and cache.</td></tr>
+    <tr><td><b>Fanout service</b></td><td>Pushes new content to friends' news feeds. Feed data is stored in the cache for fast retrieval.</td></tr>
+    <tr><td><b>Notification service</b></td><td>Tells friends new content is available and sends push notifications.</td></tr>
+  </table>
+
+  <h3>News feed building</h3>
+  <table>
+    <tr><th>Component</th><th>Role in building (Figure 11-3)</th></tr>
+    <tr><td><b>User</b></td><td>Requests their news feed: <code>/v1/me/feed</code>.</td></tr>
+    <tr><td><b>Load balancer</b></td><td>Redirects traffic to web servers.</td></tr>
+    <tr><td><b>Web servers</b></td><td>Route requests to the news feed service.</td></tr>
+    <tr><td><b>News feed service</b></td><td>Fetches the news feed from the cache.</td></tr>
+    <tr><td><b>News feed cache</b></td><td>Stores the news feed IDs needed to render the feed.</td></tr>
+  </table>
+</section>
+
+<section id="step-3">
+  <h2><span class="step-num">Step 3</span>Design deep dive</h2>
+  <p class="one-liner">The hard part is <b>fanout</b>: getting one post into thousands of feeds without overloading the system, then <b>hydrating</b> IDs into a full feed on read.</p>
+
+  <h3>Feed publishing deep dive</h3>
+  <p>Figure 11-4 (in the <a href="#tldr">TL;DR</a>) shows the detailed design. The new parts are in the web servers and the fanout service.</p>
+
+  <h4>Web servers</h4>
+  <p>Besides talking to clients, web servers enforce:</p>
+  <ul>
+    <li><b>Authentication:</b> only users signed in with a valid <code>auth_token</code> can post.</li>
+    <li><b>Rate limiting:</b> limit how many posts a user can make in a period. This is vital to prevent spam and abusive content.</li>
+  </ul>
+
+  <h4>Fanout service: push vs pull</h4>
+  <p><b>Fanout</b> is the process of delivering a post to all friends. There are two models.</p>
+  <table>
+    <tr><th></th><th>Fanout on write (push)</th><th>Fanout on read (pull)</th></tr>
+    <tr><td><b>How it works</b></td><td>Feed pre-computed at write time: the post goes into friends' caches right after publishing</td><td>Feed generated on demand at read time: recent posts are pulled when the user loads the home page</td></tr>
+    <tr><td><b>Real time</b></td><td class="yes">✓ Generated in real time and pushed to friends immediately</td><td>—</td></tr>
+    <tr><td><b>Fetch speed</b></td><td class="yes">✓ Fast (pre-computed)</td><td class="no">✗ Slow (not pre-computed)</td></tr>
+    <tr><td><b>Users with many friends</b></td><td class="no">✗ Fetching the friend list and generating all their feeds is slow: the <b>hotkey problem</b></td><td class="yes">✓ Nothing is pushed, so no hotkey problem</td></tr>
+    <tr><td><b>Inactive users</b></td><td class="no">✗ Pre-computing feeds for users who rarely log in wastes resources</td><td class="yes">✓ No resources wasted on them</td></tr>
+  </table>
+  <aside class="callout key">
+    <span class="callout-label">Key idea</span>
+    <p><b>Use a hybrid.</b> Fetching the feed fast is crucial, so use <b>push for the majority of users</b>. For <b>celebrities</b> or users with many friends/followers, let followers <b>pull</b> their content on demand to avoid overloading the system. <b>Consistent hashing</b> also mitigates the hotkey problem by distributing requests and data more evenly.</p>
+  </aside>
+
+  <div class="demo" id="fanout-demo">
+    <span class="demo-title">Try it · Hybrid fanout</span>
+    <p style="font-size:15px;margin-bottom:10px">Alice is a normal user: her posts are <b>pushed</b> into each friend's news feed cache when she posts. Cara is a celebrity: her posts are stored once, and followers <b>pull</b> them when they load their feed. Each feed cache keeps at most 5 IDs.</p>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px">
+      <button class="btn primary" id="fo-alice" type="button">Alice posts</button>
+      <button class="btn" id="fo-cara" type="button">Cara (celebrity) posts</button>
+      <button class="btn" id="fo-load" type="button">Bob loads his feed</button>
+      <button class="btn" id="fo-reset" type="button">Reset</button>
+    </div>
+    <div class="out" id="fo-caches" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px"></div>
+    <div class="out" id="fo-log" style="margin-top:12px;line-height:1.7"></div>
+  </div>
+
+  <h4>How the fanout service works</h4>
+  <figure class="fig medium">
+    <img src="../assets/img/p-173-141.jpg" alt="Fanout service: 1 get friend ids from graph DB, 2 get friends data from user cache backed by user DB, 3 send to message queue, 4 fanout workers consume, 5 write to news feed cache">
+    <figcaption><b>Figure 11-5</b> · The fanout service from Figure 11-4. Steps 1–2 decide <i>who</i> gets the post; steps 3–5 write it asynchronously.</figcaption>
+  </figure>
+  <ol class="flow">
+    <li><b>Fetch friend IDs from the graph database.</b> Graph databases suit managing friend relationships and friend recommendations.</li>
+    <li><b>Get friends' info from the user cache</b>, then filter out friends based on user settings. If you mute someone, their posts don't show in your feed even though you're still friends. A user may also share a post only with specific friends or hide it from others.</li>
+    <li><b>Send the friend list and the new post ID to the message queue.</b></li>
+    <li><b>Fanout workers fetch from the queue</b> and store the feed data in the news feed cache.</li>
+    <li><b>Store <code>&lt;post_id, user_id&gt;</code> in the news feed cache.</b> Each new post is appended to the table.</li>
+  </ol>
+  <p>The <b>news feed cache</b> is like a <code>&lt;post_id, user_id&gt;</code> mapping table (Figure 11-6, transcribed):</p>
+  <table>
+    <tr><th>post_id</th><th>user_id</th></tr>
+    <tr><td>post_id</td><td>user_id</td></tr>
+    <tr><td>post_id</td><td>user_id</td></tr>
+    <tr><td>…</td><td>… (new posts appended; size capped by a configurable limit)</td></tr>
+  </table>
+  <ul>
+    <li><b>Only IDs are stored.</b> Storing whole user and post objects would make memory use very large.</li>
+    <li>A <b>configurable limit</b> keeps the cache small. Few users scroll through thousands of posts; most only want the latest content, so the <b>cache miss rate is low</b>.</li>
+  </ul>
+
+  <h3>News feed retrieval deep dive</h3>
+  <figure class="fig">
+    <img src="../assets/img/p-174-143.jpg" alt="News feed retrieval: user requests /v1/me/feed through the load balancer to web servers with authentication and rate limiting, to the news feed service, which reads the news feed cache and then the user cache and post cache backed by user DB and post DB, and returns the feed; media is loaded from a CDN">
+    <figcaption><b>Figure 11-7</b> · Step 4 gets IDs; step 5 hydrates them from the user and post caches. Media comes straight from the CDN.</figcaption>
+  </figure>
+  <p><b>Media content</b> (images, videos, etc.) is stored in a <b>CDN</b> for fast retrieval. The client retrieves its feed like this:</p>
+  <ol class="flow">
+    <li>The user sends a request for their news feed: <code>/v1/me/feed</code>.</li>
+    <li>The load balancer redistributes requests to web servers.</li>
+    <li>Web servers call the news feed service.</li>
+    <li>The news feed service gets a list of post IDs from the news feed cache.</li>
+    <li>A feed is more than IDs: it has the username, profile picture, post content, post image, etc. So the service fetches the complete user and post objects from the <b>user cache</b> and <b>post cache</b> to build the <b>fully hydrated</b> news feed.</li>
+    <li>The hydrated feed is returned to the client as <b>JSON</b> for rendering.</li>
+  </ol>
+
+  <h3>Cache architecture</h3>
+  <p>Cache is extremely important for a news feed system. The cache tier has <b>five layers</b> (Figure 11-8, transcribed):</p>
+  <table>
+    <tr><th>Layer</th><th>Parts</th><th>What it stores</th></tr>
+    <tr><td><b>News feed</b></td><td>news feed</td><td>IDs of news feeds</td></tr>
+    <tr><td><b>Content</b></td><td>hot cache · normal</td><td>Every post's data. Popular content goes in the <b>hot cache</b>.</td></tr>
+    <tr><td><b>Social graph</b></td><td>follower · following</td><td>User relationship data</td></tr>
+    <tr><td><b>Action</b></td><td>liked · replied · others</td><td>Whether a user liked a post, replied to it, or took other actions on it</td></tr>
+    <tr><td><b>Counters</b></td><td>like counter · reply counter · other counters</td><td>Counts of likes, replies, followers, following, etc.</td></tr>
+  </table>
+</section>
+
+<section id="step-4">
+  <h2><span class="step-num">Step 4</span>Wrap up</h2>
+  <p>The design has two flows: feed publishing and news feed retrieval. There is no perfect design: every company has unique constraints, so <b>explain the trade-offs</b> of your design and technology choices. With minutes left, talk about scalability.</p>
+  <h4>Scaling the database</h4>
+  <p>The book only lists these points. The one-line reminders come from Chapters 1 and 6.</p>
+  <table>
+    <tr><th>Talking point</th><th>Reminder</th></tr>
+    <tr><td><b>Vertical vs horizontal scaling</b></td><td>Scale up (more CPU, RAM on one server) vs scale out (add more servers).</td></tr>
+    <tr><td><b>SQL vs NoSQL</b></td><td>NoSQL fits when you need super-low latency, data is unstructured or non-relational, you only serialize/deserialize data, or you store massive amounts.</td></tr>
+    <tr><td><b>Master-slave replication</b></td><td>The master takes all writes; slaves get copies and serve reads.</td></tr>
+    <tr><td><b>Read replicas</b></td><td>Add replicas to handle a high ratio of reads to writes.</td></tr>
+    <tr><td><b>Consistency models</b></td><td>Strong (never see stale data), weak, or eventual (replicas converge given time).</td></tr>
+    <tr><td><b>Database sharding</b></td><td>Split data into shards with the same schema but different data.</td></tr>
+  </table>
+  <h4>Other talking points</h4>
+  <ul>
+    <li>Keep the <b>web tier stateless</b>.</li>
+    <li><b>Cache data</b> as much as you can.</li>
+    <li>Support <b>multiple data centers</b>.</li>
+    <li><b>Loosely couple components</b> with message queues.</li>
+    <li><b>Monitor key metrics</b>, for example <b>QPS during peak hours</b> and <b>latency while users refresh their news feed</b>.</li>
+  </ul>
+</section>
+
+<section id="self-test">
+  <h2>Self-test</h2>
+  <details class="qa"><summary>What are the requirements for this news feed system?</summary><div><p>Web and mobile; publish posts and see friends' posts; reverse chronological order; up to 5,000 friends; 10M DAU; posts can contain images and videos.</p></div></details>
+  <details class="qa"><summary>What are the two core APIs and their params?</summary><div><p><code>POST /v1/me/feed</code> with <code>content</code> and <code>auth_token</code> to publish; <code>GET /v1/me/feed</code> with <code>auth_token</code> to retrieve.</p></div></details>
+  <details class="qa"><summary>Which three services do the web servers call when a user publishes a post?</summary><div><p>The post service (persists the post to DB and cache), the fanout service (pushes it to friends' news feed caches), and the notification service (tells friends and sends push notifications).</p></div></details>
+  <details class="qa"><summary>What two things do web servers enforce on publishing, and why?</summary><div><p>Authentication (only users with a valid <code>auth_token</code> can post) and rate limiting (caps posts per user per period, to prevent spam and abusive content).</p></div></details>
+  <details class="qa"><summary>Give the pros and cons of fanout on write.</summary><div><p>Pros: real-time, and fetching is fast because feeds are pre-computed. Cons: slow for users with many friends (the hotkey problem), and wasted work for inactive users.</p></div></details>
+  <details class="qa"><summary>Give the pros and cons of fanout on read.</summary><div><p>Pros: no wasted work for inactive users, and no hotkey problem. Con: fetching the feed is slow because it isn't pre-computed.</p></div></details>
+  <details class="qa"><summary>Which fanout model does the design use, and how does it handle celebrities?</summary><div><p>A hybrid: push for most users so feeds load fast; for celebrities or users with many followers, followers pull their posts on demand. Consistent hashing helps spread hotkeys evenly.</p></div></details>
+  <details class="qa"><summary>Walk through the fanout service's five steps.</summary><div><p>1) Get friend IDs from the graph DB. 2) Get friend info from the user cache and filter by settings (muted, selective sharing). 3) Send the friend list and post ID to the message queue. 4) Fanout workers consume from the queue. 5) Store <code>&lt;post_id, user_id&gt;</code> in the news feed cache.</p></div></details>
+  <details class="qa"><summary>Why does the news feed cache store only IDs, and why is a size limit OK?</summary><div><p>Full user and post objects would use too much memory. A configurable limit is fine because most users only read the latest content, so the cache miss rate stays low.</p></div></details>
+  <details class="qa"><summary>Why can a friend's post be missing from your feed even though you're friends?</summary><div><p>The fanout service filters by settings: you may have muted them, or they may have shared the post only with specific friends or hidden it from you.</p></div></details>
+  <details class="qa"><summary>What does "hydrating" the feed mean on retrieval?</summary><div><p>The news feed service turns the list of post IDs from the feed cache into full objects (username, profile picture, content, images) by fetching from the user cache and post cache, then returns JSON.</p></div></details>
+  <details class="qa"><summary>Where are images and videos served from?</summary><div><p>A CDN, for fast retrieval.</p></div></details>
+  <details class="qa"><summary>Name the five cache layers.</summary><div><p>News feed (feed IDs), content (post data, with a hot cache for popular posts), social graph (follower/following), action (liked, replied, others), counters (likes, replies, followers, following).</p></div></details>
+  <details class="qa"><summary>Which metrics does the book suggest monitoring?</summary><div><p>QPS during peak hours and latency while users refresh their news feed.</p></div></details>
+</section>
+
+<section id="glossary">
+  <h2>Terms to know</h2>
+  <dl class="glossary">
+    <dt>News feed</dt><dd>The constantly updating list of stories from people, pages and groups you follow.</dd>
+    <dt>Fanout</dt><dd>Delivering a post to all of the poster's friends.</dd>
+    <dt>Fanout on write (push)</dt><dd>Pre-compute feeds at post time by writing the post into each friend's feed cache.</dd>
+    <dt>Fanout on read (pull)</dt><dd>Build the feed on demand when the user loads it.</dd>
+    <dt>Hotkey problem</dt><dd>One key (e.g. a user with huge numbers of friends) creating disproportionate load.</dd>
+    <dt>Consistent hashing</dt><dd>A hashing scheme that spreads requests and data evenly across servers (Chapter 5).</dd>
+    <dt>Graph database</dt><dd>A database built for relationships; used for friend lists and recommendations.</dd>
+    <dt>Hydration</dt><dd>Turning feed IDs into full user and post objects before returning the feed.</dd>
+    <dt>Hot cache</dt><dd>The part of the content cache that holds popular posts.</dd>
+    <dt>CDN</dt><dd>Content delivery network: serves images and videos from servers close to the user.</dd>
+  </dl>
+  <details class="more refs"><summary>Book references (go deeper)</summary><div><ol>
+    <li><a href="https://www.facebook.com/help/327131014036297/">How News Feed Works</a></li>
+    <li><a href="http://geekswithblogs.net/brendonpage/archive/2015/10/26/friend-of-friend-recommendations-with-neo4j.aspx">Friend of Friend recommendations Neo4j and SQL Server</a></li>
+  </ol></div></details>
+</section>
+
+</main>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var CAP = 5, FRIENDS = ["Bob", "Dan", "Eve"], next, feeds, caraPosts;
+  function ids(list) {
+    return list.length ? list.map(function (p) { return "p" + p; }).join(" ") : '<span style="color:var(--ink-3)">empty</span>';
+  }
+  function box(title, note, list) {
+    return '<div style="border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:var(--bg)"><b>' + title +
+      '</b><br><small style="color:var(--ink-3)">' + note + "</small><br>" + ids(list) + "</div>";
+  }
+  function render() {
+    var html = FRIENDS.map(function (f) { return box(f + "'s feed cache", "pushed post IDs", feeds[f]); }).join("");
+    $("fo-caches").innerHTML = html + box("Cara's posts", "stored once, not fanned out", caraPosts);
+  }
+  function log(msg) { $("fo-log").innerHTML = msg; }
+  function add(list, id) { list.unshift(id); if (list.length > CAP) list.pop(); }
+  function reset() {
+    next = 1; caraPosts = []; feeds = {};
+    FRIENDS.forEach(function (f) { feeds[f] = []; });
+    render();
+    log("All caches are empty. Make a post.");
+  }
+  $("fo-alice").onclick = function () {
+    var id = next++;
+    FRIENDS.forEach(function (f) { add(feeds[f], id); });
+    render();
+    log("<b>Fanout on write:</b> Alice's p" + id + " → " + FRIENDS.length +
+      " feed-cache writes, one per friend. Her friends' reads stay fast.");
+  };
+  $("fo-cara").onclick = function () {
+    var id = next++;
+    add(caraPosts, id);
+    render();
+    log("<b>No fanout:</b> Cara's p" + id + " is stored once → 0 feed-cache writes. " +
+      "Pushing it to millions of followers would overload the system (hotkey problem).");
+  };
+  $("fo-load").onclick = function () {
+    var pulled = caraPosts.slice();
+    var merged = feeds.Bob.concat(pulled).sort(function (a, b) { return b - a; }).slice(0, CAP);
+    var parts = merged.map(function (p) {
+      return pulled.indexOf(p) >= 0 ? '<span style="color:var(--tip)">p' + p + " (pulled from Cara)</span>"
+        : '<span style="color:var(--note)">p' + p + " (pushed by Alice)</span>";
+    });
+    log("<b>Bob's feed, newest first:</b> " + (parts.length ? parts.join(", ") : "empty") +
+      '<br><small style="color:var(--ink-3)">Pre-computed IDs from his cache, merged with Cara\'s recent posts pulled on demand.</small>');
+  };
+  $("fo-reset").onclick = reset;
+  reset();
+})();
+</script>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

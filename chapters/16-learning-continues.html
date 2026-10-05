@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 16 · The Learning Continues — SDI Fast Track</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem("sdi:theme");if(t)document.documentElement.dataset.theme=JSON.parse(t)}catch(e){}</script>
+</head>
+<body data-root=".." data-chapter="16">
+<main id="content" class="chapter">
+
+<header class="chapter-hero">
+  <p class="eyebrow">Chapter 16 · Next steps</p>
+  <h1>The Learning Continues</h1>
+  <p class="lede">The book's reading list, grouped by the chapter each article deepens, plus a final mixed self-test across the whole book.</p>
+  <div class="meta-row"></div>
+  <ul class="pace">
+    <li><a href="#tldr">⚡ TL;DR <small>1 min</small></a></li>
+    <li><a href="#skeleton">🗺 How to keep going</a></li>
+    <li><a href="#real-world">📖 Reading list</a></li>
+    <li><a href="#self-test">🧠 Final review</a></li>
+  </ul>
+</header>
+
+<section id="tldr" class="tldr">
+  <h2>TL;DR</h2>
+  <ul>
+    <li>Good design sense takes years to build. The shortcut is studying <b>real-world architectures</b>.</li>
+    <li>While reading, notice both the <b>shared principles</b> (caching, replication, sharding, queues, denormalization) and the <b>underlying technologies</b>. For each technology, ask <i>what problem does it solve?</i></li>
+    <li>Interviewing with a company? <b>Read its engineering blog</b> first, so you know the systems and technologies it uses.</li>
+    <li>Must-reads that map straight onto this book: <b>Dynamo</b> (Ch 6), <b>Snowflake</b> (Ch 7), <b>Timelines at Scale</b> (Ch 11), <b>Facebook Chat / WhatsApp</b> (Ch 12), <b>Haystack</b> (Ch 14), <b>Google File System</b> and <b>Dropbox</b> (Ch 15).</li>
+    <li>Practice makes perfect: re-run the <a href="../flashcards.html">flashcards</a> and the <a href="#self-test">final review</a> until the answers come without thinking.</li>
+  </ul>
+</section>
+
+<section id="skeleton">
+  <h2>How to keep going</h2>
+  <p class="one-liner">A simple loop for the weeks before your interviews.</p>
+  <ol class="framework">
+    <li><b>Re-derive one design a day</b> Pick a chapter, close the page, and talk through the 4 steps out loud in 35–45 minutes. Then compare against its TL;DR.</li>
+    <li><b>Read one real-world article</b> from the list below that pairs with that chapter. Note what they did differently and why.</li>
+    <li><b>Drill flashcards</b> for 10 minutes. Cards you miss come back first.</li>
+    <li><b>Before an onsite</b> read the company's engineering blog, then skim the <a href="../cheatsheet.html">cheat sheet</a> the night before.</li>
+  </ol>
+</section>
+
+<section id="real-world">
+  <h2>Real-world systems</h2>
+  <p class="one-liner">The book's list, grouped by topic. Titles open a web search, because many of the book's <code>goo.gl</code> short links no longer resolve. The original link is kept next to each one.</p>
+  <h3>Scaling a whole product <a class="tag" href="01-scale-from-zero-to-millions.html">pairs with Chapter 1</a></h3>
+  <ul>
+    <li><a href="https://www.google.com/search?q=Scale+at+Facebook">Scale at Facebook</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/NGTdCs">book link</a></small></li>
+    <li><a href="https://www.google.com/search?q=Scaling+Memcache+at+Facebook">Scaling Memcache at Facebook</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/rZiAhX">book link</a></small></li>
+    <li><a href="https://www.google.com/search?q=Amazon+Architecture">Amazon Architecture</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/k4feoW">book link</a></small></li>
+    <li><a href="https://www.google.com/search?q=Google+Architecture">Google Architecture</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/dvkDiY">book link</a></small></li>
+    <li><a href="https://www.google.com/search?q=A+360+Degree+View+Of+The+Entire+Netflix+Stack">A 360 Degree View Of The Entire Netflix Stack</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/rYSDTz">book link</a></small></li>
+    <li><a href="https://www.google.com/search?q=Instagram+Architecture%3A+14+Million+Users%2C+Terabytes+Of+Photos%2C+100s+Of+Instances%2C+Dozens+Of+Technologies">Instagram Architecture: 14 Million Users, Terabytes Of Photos, 100s Of Instances, Dozens Of Technologies</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/s1VcW5">book link</a></small></li>
+    <li><a href="https://www.google.com/search?q=Scaling+Pinterest">Scaling Pinterest</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/KtmjW3">book link</a></small></li>
+    <li><a href="https://www.google.com/search?q=Pinterest+Architecture+Update">Pinterest Architecture Update</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/w6rRsf">book link</a></small></li>
+    <li><a href="https://www.google.com/search?q=A+Brief+History+of+Scaling+LinkedIn">A Brief History of Scaling LinkedIn</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/8A1Pi8">book link</a></small></li>
+    <li><a href="https://www.google.com/search?q=Flickr+Architecture">Flickr Architecture</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/dWtgYa">book link</a></small></li>
+    <li><a href="https://www.google.com/search?q=How+Uber+Scales+Their+Real-Time+Market+Platform">How Uber Scales Their Real-Time Market Platform</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/kGZuVy">book link</a></small></li>
+  </ul>
+  <h3>Storage engines &amp; key-value stores <a class="tag" href="06-key-value-store.html">pairs with Chapter 6</a></h3>
+  <ul>
+    <li><a href="https://www.google.com/search?q=Dynamo%3A+Amazon%27s+Highly+Available+Key-value+Store">Dynamo: Amazon&#x27;s Highly Available Key-value Store</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/C7zxDL">book link</a></small></li>
+    <li><a href="https://www.google.com/search?q=Bigtable%3A+A+Distributed+Storage+System+for+Structured+Data">Bigtable: A Distributed Storage System for Structured Data</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/6NaZca">book link</a></small></li>
+    <li><a href="https://www.google.com/search?q=TAO%3A+Facebook%27s+Distributed+Data+Store+for+the+Social+Graph">TAO: Facebook&#x27;s Distributed Data Store for the Social Graph</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/Tk1DyH">book link</a></small></li>
+  </ul>
+  <h3>Unique IDs <a class="tag" href="07-unique-id-generator.html">pairs with Chapter 7</a></h3>
+  <ul>
+    <li><a href="https://www.google.com/search?q=Announcing+Snowflake">Announcing Snowflake</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/GzVWYm">book link</a></small></li>
+  </ul>
+  <h3>Feeds &amp; timelines <a class="tag" href="11-news-feed.html">pairs with Chapter 11</a></h3>
+  <ul>
+    <li><a href="https://www.google.com/search?q=Facebook+Timeline%3A+Brought+To+You+By+The+Power+Of+Denormalization">Facebook Timeline: Brought To You By The Power Of Denormalization</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/FCNrbm">book link</a></small></li>
+    <li><a href="https://www.google.com/search?q=Building+Timeline%3A+Scaling+up+to+hold+your+life+story">Building Timeline: Scaling up to hold your life story</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/8p5wDV">book link</a></small></li>
+    <li><a href="https://www.google.com/search?q=Serving+Facebook+Multifeed%3A+Efficiency%2C+performance+gains+through+redesign">Serving Facebook Multifeed: Efficiency, performance gains through redesign</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/adFVMQ">book link</a></small></li>
+    <li><a href="https://www.google.com/search?q=Timelines+at+Scale">Timelines at Scale</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/8KbqTy">book link</a></small></li>
+    <li><a href="https://www.google.com/search?q=The+Architecture+Twitter+Uses+To+Deal+With+150M+Active+Users">The Architecture Twitter Uses To Deal With 150M Active Users</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/EwvfRd">book link</a></small></li>
+    <li><a href="https://www.google.com/search?q=Scaling+Twitter%3A+Making+Twitter+10000+Percent+Faster">Scaling Twitter: Making Twitter 10000 Percent Faster</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/nYGC1k">book link</a></small></li>
+  </ul>
+  <h3>Chat <a class="tag" href="12-chat-system.html">pairs with Chapter 12</a></h3>
+  <ul>
+    <li><a href="https://www.google.com/search?q=Erlang+at+Facebook+%28Facebook+chat%29">Erlang at Facebook (Facebook chat)</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/zSLHrj">book link</a></small></li>
+    <li><a href="https://www.google.com/search?q=Facebook+Chat">Facebook Chat</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/qzSiWC">book link</a></small></li>
+    <li><a href="https://www.google.com/search?q=The+WhatsApp+Architecture+Facebook+Bought+For+%2419+Billion">The WhatsApp Architecture Facebook Bought For $19 Billion</a> <small style="color:var(--ink-3)">· <a href="https://bit.ly/2AHJnFn">book link</a></small></li>
+  </ul>
+  <h3>Video &amp; photo storage <a class="tag" href="14-youtube.html">pairs with Chapter 14</a></h3>
+  <ul>
+    <li><a href="https://www.google.com/search?q=YouTube+Architecture">YouTube Architecture</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/mCPRUF">book link</a></small></li>
+    <li><a href="https://www.google.com/search?q=Seattle+Conference+on+Scalability%3A+YouTube+Scalability">Seattle Conference on Scalability: YouTube Scalability</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/dH3zYq">book link</a></small></li>
+    <li><a href="https://www.google.com/search?q=Finding+a+needle+in+Haystack%3A+Facebook%27s+photo+storage">Finding a needle in Haystack: Facebook&#x27;s photo storage</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/edj4FL">book link</a></small></li>
+  </ul>
+  <h3>File sync &amp; storage <a class="tag" href="15-google-drive.html">pairs with Chapter 15</a></h3>
+  <ul>
+    <li><a href="https://www.google.com/search?q=The+Google+File+System">The Google File System</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/xj5n9R">book link</a></small></li>
+    <li><a href="https://www.google.com/search?q=Differential+Synchronization+%28Google+Docs%29">Differential Synchronization (Google Docs)</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/9zqG7x">book link</a></small></li>
+    <li><a href="https://www.google.com/search?q=How+We%27ve+Scaled+Dropbox">How We&#x27;ve Scaled Dropbox</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/NjBDtC">book link</a></small></li>
+  </ul>
+  <h3>Experimentation &amp; recommendations <span class="tag">Beyond the chapters</span></h3>
+  <ul>
+    <li><a href="https://www.google.com/search?q=It%27s+All+A%2FBout+Testing%3A+The+Netflix+Experimentation+Platform">It&#x27;s All A/Bout Testing: The Netflix Experimentation Platform</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/agbA4K">book link</a></small></li>
+    <li><a href="https://www.google.com/search?q=Netflix+Recommendations%3A+Beyond+the+5+stars+%28Part+1%29">Netflix Recommendations: Beyond the 5 stars (Part 1)</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/A4FkYi">book link</a></small></li>
+    <li><a href="https://www.google.com/search?q=Netflix+Recommendations%3A+Beyond+the+5+stars+%28Part+2%29">Netflix Recommendations: Beyond the 5 stars (Part 2)</a> <small style="color:var(--ink-3)">· <a href="https://goo.gl/XNPMXm">book link</a></small></li>
+  </ul>
+</section>
+
+<section id="blogs">
+  <h2>Company engineering blogs</h2>
+  <p class="one-liner">Interviewing somewhere? Read their blog first. Reading a few regularly also makes you a better engineer.</p>
+  <ul class="tags">
+    <li><a href="https://medium.com/airbnb-engineering">Airbnb</a></li>
+    <li><a href="https://developer.amazon.com/blogs">Amazon</a></li>
+    <li><a href="https://blog.asana.com/category/eng">Asana</a></li>
+    <li><a href="https://developer.atlassian.com/blog">Atlassian</a></li>
+    <li><a href="http://engineering.bittorrent.com">Bittorrent</a></li>
+    <li><a href="https://blog.cloudera.com">Cloudera</a></li>
+    <li><a href="https://blog.docker.com">Docker</a></li>
+    <li><a href="https://blogs.dropbox.com/tech">Dropbox</a></li>
+    <li><a href="http://www.ebaytechblog.com">eBay</a></li>
+    <li><a href="https://code.facebook.com/posts">Facebook</a></li>
+    <li><a href="https://githubengineering.com">GitHub</a></li>
+    <li><a href="https://developers.googleblog.com">Google</a></li>
+    <li><a href="https://engineering.groupon.com">Groupon</a></li>
+    <li><a href="http://highscalability.com">Highscalability</a></li>
+    <li><a href="https://tech.instacart.com">Instacart</a></li>
+    <li><a href="https://engineering.instagram.com">Instagram</a></li>
+    <li><a href="https://engineering.linkedin.com/blog">LinkedIn</a></li>
+    <li><a href="https://mixpanel.com/blog">Mixpanel</a></li>
+    <li><a href="https://medium.com/netflix-techblog">Netflix</a></li>
+    <li><a href="https://engblog.nextdoor.com">Nextdoor</a></li>
+    <li><a href="https://www.paypal-engineering.com">PayPal</a></li>
+    <li><a href="https://engineering.pinterest.com">Pinterest</a></li>
+    <li><a href="https://engineering.quora.com">Quora</a></li>
+    <li><a href="https://redditblog.com">Reddit</a></li>
+    <li><a href="https://developer.salesforce.com/blogs/engineering">Salesforce</a></li>
+    <li><a href="https://engineering.shopify.com">Shopify</a></li>
+    <li><a href="https://slack.engineering">Slack</a></li>
+    <li><a href="https://developers.soundcloud.com/blog">Soundcloud</a></li>
+    <li><a href="https://labs.spotify.com">Spotify</a></li>
+    <li><a href="https://stripe.com/blog/engineering">Stripe</a></li>
+    <li><a href="https://github.com/donnemartin/system-design-primer">System design primer</a></li>
+    <li><a href="https://blog.twitter.com/engineering/en_us.html">Twitter</a></li>
+    <li><a href="https://www.thumbtack.com/engineering">Thumbtack</a></li>
+    <li><a href="http://eng.uber.com">Uber</a></li>
+    <li><a href="https://yahooeng.tumblr.com">Yahoo</a></li>
+    <li><a href="https://engineeringblog.yelp.com">Yelp</a></li>
+    <li><a href="https://medium.com/zoom-developer-blog">Zoom</a></li>
+  </ul>
+</section>
+
+<section id="self-test">
+  <h2>Final review: across the whole book</h2>
+  <p class="one-liner">Mixed questions from every chapter. If any feel shaky, the chapter is linked in the answer.</p>
+  <details class="qa"><summary>How should you split a 45-minute system design interview across the four steps?</summary><div><p>Understand the problem and scope: 3–10 min. High-level design and buy-in: 10–15 min. Deep dive: 10–25 min. Wrap up: 3–5 min. (<a href="03-interview-framework.html">Ch 3</a>)</p></div></details>
+  <details class="qa"><summary>In master-slave replication, what happens when the master database goes offline?</summary><div><p>A slave is promoted to be the new master, and a new slave replaces the old one for replication. (<a href="01-scale-from-zero-to-millions.html">Ch 1</a>)</p></div></details>
+  <details class="qa"><summary>Which rate-limiting algorithm allows short bursts and is used by Amazon and Stripe?</summary><div><p>The <b>token bucket</b>. (<a href="04-rate-limiter.html">Ch 4</a>)</p></div></details>
+  <details class="qa"><summary>Why do virtual nodes improve consistent hashing?</summary><div><p>Each server owns many small partitions, so keys spread more evenly. The standard deviation is about 10% of the mean with 100 virtual nodes and 5% with 200. The cost is more space for the virtual-node metadata. (<a href="05-consistent-hashing.html">Ch 5</a>)</p></div></details>
+  <details class="qa"><summary>With N replicas, write quorum W and read quorum R, when is strong consistency guaranteed?</summary><div><p>When <b>W + R &gt; N</b> (typically N = 3, W = R = 2), because at least one node overlaps between the write set and the read set. (<a href="06-key-value-store.html">Ch 6</a>)</p></div></details>
+  <details class="qa"><summary>What is the Snowflake ID bit layout?</summary><div><p>1 sign | 41 timestamp | 5 datacenter | 5 machine | 12 sequence. (<a href="07-unique-id-generator.html">Ch 7</a>)</p></div></details>
+  <details class="qa"><summary>URL shortener: 301 or 302 redirect if you care about click analytics?</summary><div><p><b>302</b> (temporary). Every click then reaches your servers. A 301 is cached by the browser, which reduces server load but hides repeat clicks. (<a href="08-url-shortener.html">Ch 8</a>)</p></div></details>
+  <details class="qa"><summary>Which data structures implement a crawler's "URL Seen?" check?</summary><div><p>A <b>Bloom filter</b> or a <b>hash table</b>. (<a href="09-web-crawler.html">Ch 9</a>)</p></div></details>
+  <details class="qa"><summary>How does a notification system avoid losing notifications?</summary><div><p>It persists them in a <b>notification log</b> database and retries delivery. Dedupe by event ID because exactly-once delivery can't be guaranteed. (<a href="10-notification-system.html">Ch 10</a>)</p></div></details>
+  <details class="qa"><summary>News feed: fanout on write or on read?</summary><div><p>A <b>hybrid</b>. Push (fanout on write) for most users, so reads are fast. Pull (fanout on read) for celebrities and users with huge follower counts, to avoid overloading the system. (<a href="11-news-feed.html">Ch 11</a>)</p></div></details>
+  <details class="qa"><summary>Why does the chat system use WebSocket?</summary><div><p>It's a persistent, <b>bi-directional</b> connection the server can push messages over. It starts as HTTP and is upgraded, and it uses ports 80/443, so it generally works through firewalls. (<a href="12-chat-system.html">Ch 12</a>)</p></div></details>
+  <details class="qa"><summary>Autocomplete: how do you make getting the top-k suggestions for a prefix fast?</summary><div><p>Limit the max prefix length and <b>cache the top-k queries at every trie node</b>. Both lookup steps then become ~O(1). (<a href="13-search-autocomplete.html">Ch 13</a>)</p></div></details>
+  <details class="qa"><summary>YouTube: how do you let only authorized users upload straight to cloud storage?</summary><div><p>Give them a <b>pre-signed upload URL</b> from the API servers. (<a href="14-youtube.html">Ch 14</a>)</p></div></details>
+  <details class="qa"><summary>Google Drive: why split files into blocks?</summary><div><p>For <b>delta sync</b> (only modified blocks are uploaded) and per-block compression. Both save bandwidth. Dropbox caps blocks at 4 MB. (<a href="15-google-drive.html">Ch 15</a>)</p></div></details>
+</section>
+
+<section id="glossary">
+  <h2>Afterword</h2>
+  <p>You've reached the end. The author's closing advice: landing a dream job is a long journey, and <b>practice makes perfect</b>.</p>
+  <details class="more refs"><summary>Book links</summary><div><ol>
+    <li><a href="https://bit.ly/3dtIcsE">Author's email list (new chapters)</a></li>
+    <li><a href="https://tinyurl.com/y7d3ltbc">Review the book on Amazon</a></li>
+  </ol></div></details>
+</section>
+
+</main>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

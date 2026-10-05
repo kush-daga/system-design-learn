@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 8 · Design a URL Shortener — SDI Fast Track</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem("sdi:theme");if(t)document.documentElement.dataset.theme=JSON.parse(t)}catch(e){}</script>
+</head>
+<body data-root=".." data-chapter="8">
+<main id="content" class="chapter">
+
+<header class="chapter-hero">
+  <p class="eyebrow">Chapter 8 · Design problem</p>
+  <h1>Design a URL Shortener</h1>
+  <p class="lede">The classic TinyURL question: size it, pick 301 or 302, work out why codes are 7 characters, compare hashing with base-62 conversion, and walk the shorten and redirect flows.</p>
+  <div class="meta-row"></div>
+  <ul class="pace">
+    <li><a href="#tldr">⚡ TL;DR <small>2 min</small></a></li>
+    <li><a href="#skeleton">🗣 Interview answer <small>3 min</small></a></li>
+    <li><a href="#step-1">📖 Full walkthrough</a></li>
+    <li><a href="#self-test">🧠 Self-test</a></li>
+  </ul>
+</header>
+
+<section id="tldr" class="tldr">
+  <h2>TL;DR</h2>
+  <ul>
+    <li><b>Scale:</b> 100 million new URLs/day → <b>~1,160 writes/s</b>, <b>11,600 reads/s</b> (10:1), <b>365 billion</b> records in 10 years (~36.5 TB at 100 bytes each).</li>
+    <li><b>APIs:</b> <code>POST api/v1/data/shorten {longUrl}</code> → short URL; <code>GET api/v1/shortUrl</code> → redirect.</li>
+    <li><b>301 vs 302:</b> 301 is permanent and cached by the browser (less load); 302 sends every click through you (better analytics).</li>
+    <li><b>Storage:</b> relational table <code>(id, shortURL, longURL)</code>; an in-memory hash table is too expensive.</li>
+    <li><b>Length:</b> 62 characters <code>[0-9a-zA-Z]</code>; 62<sup>7</sup> ≈ 3.5 trillion ≥ 365 billion → <b>7 characters</b>.</li>
+    <li><b>Making the code:</b> hash (CRC32/MD5/SHA-1), keep 7 characters and resolve collisions, or <b>base-62 encode a unique ID</b>. Base 62 wins: no collisions, but length grows with the ID and codes are guessable.</li>
+    <li><b>Shorten:</b> long URL already stored? Return its code. Else new ID → base 62 → save.</li>
+    <li><b>Redirect:</b> load balancer → web server → cache → database.</li>
+    <li><b>Wrap-up:</b> rate limiter, web/DB scaling, analytics, availability.</li>
+  </ul>
+  <figure class="fig">
+    <img src="../assets/img/p-129-109.jpg" alt="User sends GET for the short URL to a load balancer, which forwards to web servers that check a cache and then a database, and the long URL is returned">
+    <figcaption><b>Figure 8-8</b> · The redirect path (10× the write traffic), with a cache in front of the database.</figcaption>
+  </figure>
+</section>
+
+<section id="skeleton">
+  <h2>Interview answer skeleton</h2>
+  <p class="one-liner">If asked this in an interview, walk through these four beats. Each maps to a step below.</p>
+  <ol class="framework">
+    <li><b>Clarify (≈5 min)</b> Ask for an example, traffic (100M URLs/day), length (as short as possible), allowed characters (0-9, a-z, A-Z), delete/update (no). Estimate: 1,160 writes/s, 11,600 reads/s, 365 billion records, ~36.5 TB.</li>
+    <li><b>High-level (≈10 min)</b> Two endpoints: POST to shorten, GET to redirect. Choose 301 to cut server load or 302 for click analytics. Start from a hash table of &lt;shortURL, longURL&gt;.</li>
+    <li><b>Deep dive (≈20 min)</b> Relational table (id, shortURL, longURL). 62<sup>7</sup> → 7 characters. Compare hash + collision resolution with base-62 conversion, pick base 62 on a unique ID, then walk the shortening flow and the cached redirect flow.</li>
+    <li><b>Wrap up (≈5 min)</b> Rate limiter, stateless web tier, DB replication and sharding, analytics, availability/consistency/reliability.</li>
+  </ol>
+</section>
+
+<section id="step-1">
+  <h2><span class="step-num">Step 1</span>Understand the problem and establish design scope</h2>
+  <p class="one-liner">Two use cases, <b>100 million new URLs a day</b>, and codes as short as possible from <code>[0-9a-zA-Z]</code>.</p>
+  <table class="qa-table">
+    <tr><th>You ask</th><th>Interviewer says</th></tr>
+    <tr><td>Can you give an example of how a URL shortener works?</td><td>The original URL is <code>https://www.systeminterview.com/q=chatsystem&amp;c=loggedin&amp;v=v3&amp;l=long</code>. The service creates a shorter alias, <code>https://tinyurl.com/y7keocwj</code>. Clicking the alias redirects you to the original URL.</td></tr>
+    <tr><td>What is the traffic volume?</td><td>100 million URLs are generated per day.</td></tr>
+    <tr><td>How long is the shortened URL?</td><td>As short as possible.</td></tr>
+    <tr><td>What characters are allowed in the shortened URL?</td><td>Numbers (0-9) and characters (a-z, A-Z).</td></tr>
+    <tr><td>Can shortened URLs be deleted or updated?</td><td>For simplicity, no.</td></tr>
+  </table>
+  <h4>Use cases</h4>
+  <ul class="checklist">
+    <li><b>URL shortening:</b> given a long URL, return a much shorter URL</li>
+    <li><b>URL redirecting:</b> given a short URL, redirect to the original URL</li>
+    <li>High availability, scalability and fault tolerance</li>
+  </ul>
+
+  <h3>Back-of-the-envelope estimation</h3>
+  <table>
+    <tr><th>Quantity</th><th>Arithmetic</th><th>Result</th></tr>
+    <tr><td>Writes per day</td><td>given</td><td>100 million</td></tr>
+    <tr><td>Writes per second</td><td>100 million / 24 / 3600</td><td>≈ <b>1,160</b></td></tr>
+    <tr><td>Reads per second</td><td>read:write = 10:1 → 1,160 × 10</td><td><b>11,600</b></td></tr>
+    <tr><td>Records over 10 years</td><td>100 million × 365 × 10</td><td><b>365 billion</b></td></tr>
+    <tr><td>Average URL length</td><td>assumption</td><td>100 bytes</td></tr>
+    <tr><td>Storage over 10 years</td><td>365 billion × 100 bytes</td><td><b>36.5 TB</b> (the book says 365 TB; see below)</td></tr>
+  </table>
+  <aside class="callout warn">
+    <span class="callout-label">Pitfall</span>
+    <p>The book writes "365 billion × 100 bytes × 10 years = 365 TB", counting the 10 years twice (it's already in the 365 billion). The correct figure is 365 × 10<sup>9</sup> × 100 B ≈ <b>36.5 TB</b>.</p>
+  </aside>
+  <p>Walk through the assumptions and arithmetic with the interviewer so you agree on the numbers.</p>
+</section>
+
+<section id="step-2">
+  <h2><span class="step-num">Step 2</span>Propose high-level design and get buy-in</h2>
+  <p class="one-liner">Two REST endpoints, a <b>301 or 302 redirect</b>, and a hash function that maps a long URL to a short <b>hashValue</b>.</p>
+
+  <h3>API endpoints</h3>
+  <p>REST-style. A URL shortener needs two:</p>
+  <table>
+    <tr><th>Use case</th><th>Endpoint</th><th>Request</th><th>Returns</th></tr>
+    <tr><td>Shorten</td><td><code>POST api/v1/data/shorten</code></td><td><code>{longUrl: longURLString}</code></td><td>shortURL</td></tr>
+    <tr><td>Redirect</td><td><code>GET api/v1/shortUrl</code></td><td>the short URL</td><td>longURL, for the HTTP redirect</td></tr>
+  </table>
+
+  <h3>URL redirecting</h3>
+  <p>The server answers a short-URL request with a <b>301 redirect</b> to the long URL. What the browser sees (Figure 8-1, other headers omitted):</p>
+  <pre><code>Request URL:    https://tinyurl.com/qtj5opu
+Request Method: GET
+Status Code:    301
+...
+location: https://www.amazon.com/dp/B017V4NTFA?pLink=63eaef76-979c-4d&amp;ref=adblp13nvvxx_0_2_im</code></pre>
+  <figure class="fig small">
+    <img src="../assets/img/p-122-099.jpg" alt="Sequence: client visits the short URL on the tinyurl server, gets status 301 with location set to the long URL, then visits the long URL on the Amazon server">
+    <figcaption><b>Figure 8-2</b> · The shortener answers 301 with a <code>location</code> header; the client then fetches the long URL itself.</figcaption>
+  </figure>
+
+  <h4>301 vs 302 redirect</h4>
+  <table>
+    <tr><th></th><th>301 redirect</th><th>302 redirect</th></tr>
+    <tr><td>Meaning</td><td>URL "permanently" moved to the long URL</td><td>URL "temporarily" moved to the long URL</td></tr>
+    <tr><td>Browser caches it?</td><td class="yes">✓ Later requests go straight to the long-URL server</td><td class="no">✗ Every request hits the shortener first, then redirects</td></tr>
+    <tr><td>Server load</td><td>Low: only the first request for a URL reaches you</td><td>Higher</td></tr>
+    <tr><td>Analytics (click rate, click source)</td><td>Hard</td><td>Easy</td></tr>
+    <tr><td><b>Use when</b></td><td>The priority is reducing server load</td><td>Analytics are important</td></tr>
+  </table>
+
+  <h3>The hash table approach</h3>
+  <p>The most intuitive implementation is a hash table of &lt;shortURL, longURL&gt; pairs. Redirecting is then:</p>
+  <pre><code>longURL = hashTable.get(shortURL)
+// then perform the URL redirect</code></pre>
+
+  <h3>URL shortening</h3>
+  <p>Assume short URLs look like <code>www.tinyurl.com/{hashValue}</code>. You need a hash function <b>fx</b> that maps a long URL to the hashValue.</p>
+  <figure class="fig small">
+    <img src="../assets/img/p-123-100.jpg" alt="longURL goes into hash function fx, which outputs the hashValue qtj5opu appended to https://tinyurl.com/">
+    <figcaption><b>Figure 8-3</b> · fx turns the long URL into the part after the slash.</figcaption>
+  </figure>
+  <p>The hash function must satisfy two requirements:</p>
+  <ul class="checklist">
+    <li>Each longURL is hashed to one hashValue.</li>
+    <li>Each hashValue can be mapped back to the longURL.</li>
+  </ul>
+</section>
+
+<section id="step-3">
+  <h2><span class="step-num">Step 3</span>Design deep dive</h2>
+  <p class="one-liner">Store mappings in a <b>relational database</b>, make <b>7-character base-62</b> codes from unique IDs, and put a <b>cache</b> in front of reads.</p>
+
+  <h3>Data model</h3>
+  <p>A hash table is a fine start, but memory is limited and expensive, so store the &lt;shortURL, longURL&gt; mapping in a <b>relational database</b>. The simplified <code>url</code> table (Figure 8-4):</p>
+  <table>
+    <tr><th>Column</th><th>Notes</th></tr>
+    <tr><td><code>id</code></td><td>Primary key, auto increment</td></tr>
+    <tr><td><code>shortURL</code></td><td>The hashValue, e.g. <code>zn9edcu</code></td></tr>
+    <tr><td><code>longURL</code></td><td>The original URL</td></tr>
+  </table>
+
+  <h3>Hash value length</h3>
+  <p>The hashValue uses <code>[0-9, a-z, A-Z]</code>: 10 + 26 + 26 = <b>62 possible characters</b>. Find the smallest n with 62<sup>n</sup> ≥ 365 billion (the estimate).</p>
+  <table>
+    <tr><th>n</th><th>Maximum number of URLs (62<sup>n</sup>)</th></tr>
+    <tr><td>1</td><td>62</td></tr>
+    <tr><td>2</td><td>3,844</td></tr>
+    <tr><td>3</td><td>238,328</td></tr>
+    <tr><td>4</td><td>14,776,336</td></tr>
+    <tr><td>5</td><td>916,132,832</td></tr>
+    <tr><td>6</td><td>56,800,235,584 (≈ 56.8 billion: too few)</td></tr>
+    <tr><td><b>7</b></td><td><b>3,521,614,606,208 ≈ 3.5 trillion</b></td></tr>
+  </table>
+  <p>3.5 trillion easily holds 365 billion URLs, so <b>the hashValue is 7 characters</b>. Two ways to produce it follow.</p>
+
+  <h3>Approach 1 · Hash + collision resolution</h3>
+  <p>Hash the long URL with a well-known hash function. Results for <code>https://en.wikipedia.org/wiki/Systems_design</code>:</p>
+  <table>
+    <tr><th>Hash function</th><th>Hash value (hexadecimal)</th></tr>
+    <tr><td>CRC32</td><td><code>5cb54054</code></td></tr>
+    <tr><td>MD5</td><td><code>5a62509a84df9ee03fe1230b9df8b84e</code></td></tr>
+    <tr><td>SHA-1</td><td><code>0eeae7916c06853901d9ccbefbfcaf4de57ed85b</code></td></tr>
+  </table>
+  <p>Even the shortest (CRC32, 8 characters) is too long. Keeping only the first 7 characters can cause <b>hash collisions</b>. To resolve them, <b>recursively append a new predefined string</b> to the long URL and hash again until the shortURL isn't already in the DB:</p>
+  <figure class="fig medium">
+    <img src="../assets/img/p-126-104.jpg" alt="Flowchart: input longURL, hash function, shortURL, exists in DB? yes loops back with longURL plus predefined string, no saves to DB">
+    <figcaption><b>Figure 8-5</b> · On a collision, loop back with longURL + predefined string; otherwise save.</figcaption>
+  </figure>
+  <p>This eliminates collisions, but <b>querying the database for every request is expensive</b>. A <b>bloom filter</b> (a space-efficient probabilistic test of whether an element is in a set) can improve performance.</p>
+  <aside class="callout note">
+    <span class="callout-label">Beyond the book</span>
+    <p>A bloom filter can give false positives but <b>never false negatives</b>. "Not present" is certain, so no database read is needed; only "maybe present" needs the check.</p>
+  </aside>
+
+  <h3>Approach 2 · Base 62 conversion</h3>
+  <p><b>Base conversion</b> rewrites a number in a different number system. Base 62 matches the 62 possible characters:</p>
+  <table>
+    <tr><th>Value</th><th>0–9</th><th>10–35</th><th>36–61</th></tr>
+    <tr><td>Character</td><td><code>0</code>–<code>9</code></td><td><code>a</code>–<code>z</code> (a = 10)</td><td><code>A</code>–<code>Z</code> (Z = 61)</td></tr>
+  </table>
+  <h4>Worked example: convert 11157<sub>10</sub> to base 62</h4>
+  <p>11157 = 2 × 62<sup>2</sup> + 55 × 62<sup>1</sup> + 59 × 62<sup>0</sup> = [2, 55, 59] → <b>[2, T, X]</b>. Divide by 62 repeatedly and read the remainders from bottom to top (Figure 8-6):</p>
+  <table>
+    <tr><th>Divide</th><th>Quotient</th><th>Remainder</th><th>Base-62 character</th></tr>
+    <tr><td>11157 ÷ 62</td><td>179</td><td>59</td><td><code>X</code></td></tr>
+    <tr><td>179 ÷ 62</td><td>2</td><td>55</td><td><code>T</code></td></tr>
+    <tr><td>2 ÷ 62</td><td>0</td><td>2</td><td><code>2</code></td></tr>
+  </table>
+  <p>So the short URL is <code>https://tinyurl.com/2TX</code>.</p>
+
+  <div class="demo" id="b62-demo">
+    <span class="demo-title">Try it · Base-62 converter</span>
+    <p style="font-size:15px;margin-bottom:10px">Encode a decimal ID to see the repeated division by 62, or decode a short code back to its ID. The presets are the book's two examples.</p>
+    <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px">
+      <input id="b62-id" value="11157" inputmode="numeric" style="flex:1;min-width:200px" aria-label="Decimal ID">
+      <button class="btn primary" id="b62-enc" type="button">ID → short code</button>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px">
+      <input id="b62-code" value="zn9edcu" style="flex:1;min-width:200px" aria-label="Short code">
+      <button class="btn" id="b62-dec" type="button">Short code → ID</button>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px;font-size:14px">
+      Book examples: <button class="btn" id="b62-p1" type="button">11157</button><button class="btn" id="b62-p2" type="button">2009215674938</button>
+    </div>
+    <div class="out" id="b62-out" style="line-height:1.8;overflow-wrap:anywhere"></div>
+  </div>
+
+  <h3>Comparing the two approaches</h3>
+  <table>
+    <tr><th></th><th>Hash + collision resolution</th><th>Base 62 conversion</th></tr>
+    <tr><td>Short URL length</td><td>Fixed</td><td>Not fixed: grows with the ID</td></tr>
+    <tr><td>Needs a unique ID generator?</td><td>No</td><td>Yes</td></tr>
+    <tr><td>Collisions</td><td>Possible, must be resolved</td><td>Impossible, because IDs are unique</td></tr>
+    <tr><td>Can someone guess the next short URL?</td><td>No: it doesn't depend on an ID</td><td>Yes, if the ID increments by 1 per entry. This can be a security concern.</td></tr>
+  </table>
+
+  <h3>URL shortening deep dive</h3>
+  <p>The design uses <b>base 62 conversion</b>:</p>
+  <ol class="flow">
+    <li>Input: longURL.</li>
+    <li>Check whether the longURL is already in the database.</li>
+    <li>If it is, it was shortened before: fetch its shortURL from the database and return it.</li>
+    <li>If not, the longURL is new. The <b>unique ID generator</b> creates a new ID (the primary key).</li>
+    <li>Convert the ID to a shortURL with base 62 conversion.</li>
+    <li>Save a new row with the ID, shortURL and longURL.</li>
+  </ol>
+  <figure class="fig small">
+    <img src="../assets/img/p-128-107.jpg" alt="Flowchart: input longURL; longURL in DB? yes returns shortURL; no generates a new ID, converts the ID to shortURL, saves ID, shortURL and longURL in DB">
+    <figcaption><b>Figure 8-7</b> · The "yes" branch returns the existing code for a repeated long URL.</figcaption>
+  </figure>
+  <h4>Concrete example</h4>
+  <p>Input <code>https://en.wikipedia.org/wiki/Systems_design</code>. The unique ID generator returns <code>2009215674938</code>, base 62 turns it into <code>zn9edcu</code>, and the row is saved (Table 8-4):</p>
+  <table>
+    <tr><th>id</th><th>shortURL</th><th>longURL</th></tr>
+    <tr><td>2009215674938</td><td>zn9edcu</td><td>https://en.wikipedia.org/wiki/Systems_design</td></tr>
+  </table>
+  <p>The <b>distributed unique ID generator</b> issues the globally unique IDs behind shortURLs. Building one in a highly distributed environment is hard; see <a href="07-unique-id-generator.html">Chapter 7</a>.</p>
+  <aside class="callout note">
+    <span class="callout-label">Beyond the book</span>
+    <p>Codes stay 7 characters only while IDs are below 62<sup>7</sup> ≈ 3.5 trillion. A 64-bit Snowflake ID (Chapter 7) is around 10<sup>18</sup> and encodes to 11 characters, so short codes need a compact counter (e.g. ticket-server ranges) instead.</p>
+  </aside>
+
+  <h3>URL redirecting deep dive</h3>
+  <p>Reads outnumber writes, so the &lt;shortURL, longURL&gt; mapping is <b>stored in a cache</b>.</p>
+  <figure class="fig">
+    <img src="../assets/img/p-129-109.jpg" alt="Numbered redirect flow: user, load balancer, web servers, cache, database, long URL returned">
+    <figcaption><b>Figure 8-8</b> · Steps 3 and 4: cache first, database on a miss.</figcaption>
+  </figure>
+  <ol class="flow">
+    <li>A user clicks a short URL link: <code>https://tinyurl.com/zn9edcu</code>.</li>
+    <li>The load balancer forwards the request to the web servers.</li>
+    <li>If the shortURL is already in the cache, return the longURL directly.</li>
+    <li>If not, fetch the longURL from the database. If it isn't in the database either, the user probably entered an invalid shortURL.</li>
+    <li>The longURL is returned to the user.</li>
+  </ol>
+</section>
+
+<section id="step-4">
+  <h2><span class="step-num">Step 4</span>Wrap up</h2>
+  <p>We covered the API design, data model, hash function, URL shortening and URL redirecting. If there's time left, raise these:</p>
+  <ul>
+    <li><b>Rate limiter.</b> Malicious users could send an overwhelming number of shortening requests. A rate limiter filters requests by IP address or other rules (see <a href="04-rate-limiter.html">Chapter 4</a>).</li>
+    <li><b>Web server scaling.</b> The web tier is stateless, so scale it by adding or removing web servers.</li>
+    <li><b>Database scaling.</b> Database replication and sharding are the common techniques.</li>
+    <li><b>Analytics.</b> Integrate an analytics solution to answer questions like how many people click a link and when.</li>
+    <li><b>Availability, consistency and reliability.</b> These are at the core of any large system's success (see <a href="01-scale-from-zero-to-millions.html">Chapter 1</a>).</li>
+  </ul>
+</section>
+
+<section id="self-test">
+  <h2>Self-test</h2>
+  <details class="qa"><summary>What are the traffic numbers for this design, and how do you derive them?</summary><div><p>100 million writes/day ÷ 24 ÷ 3600 ≈ <b>1,160 writes/s</b>. With a 10:1 read:write ratio, <b>11,600 reads/s</b>. Over 10 years, 100 million × 365 × 10 = <b>365 billion</b> records.</p></div></details>
+  <details class="qa"><summary>How much storage do 10 years of URLs need at 100 bytes each?</summary><div><p>365 billion × 100 bytes ≈ <b>36.5 TB</b>. The book prints 365 TB because it multiplies by 10 years a second time.</p></div></details>
+  <details class="qa"><summary>What are the two API endpoints?</summary><div><p><code>POST api/v1/data/shorten</code> with <code>{longUrl: longURLString}</code>, which returns the shortURL. <code>GET api/v1/shortUrl</code>, which returns the longURL for the HTTP redirect.</p></div></details>
+  <details class="qa"><summary>301 or 302: which one reduces server load, which one is better for analytics, and why?</summary><div><p><b>301</b> (permanent) is cached by the browser, so only the first request reaches the shortener, which means less load. <b>302</b> (temporary) sends every request through the shortener first, so you can track click rate and source.</p></div></details>
+  <details class="qa"><summary>Why store the mapping in a relational database rather than a hash table?</summary><div><p>A hash table in memory isn't feasible for real systems: memory is limited and expensive. The table is <code>url(id PK auto increment, shortURL, longURL)</code>.</p></div></details>
+  <details class="qa"><summary>Why is the hashValue 7 characters long?</summary><div><p>It uses 62 characters (10 + 26 + 26). You need the smallest n with 62<sup>n</sup> ≥ 365 billion. 62<sup>6</sup> ≈ 56.8 billion is too few; 62<sup>7</sup> ≈ 3.5 trillion is enough.</p></div></details>
+  <details class="qa"><summary>Why not just use CRC32, MD5 or SHA-1 output as the short code?</summary><div><p>The outputs are too long (CRC32 is 8 hex characters, MD5 32, SHA-1 40). Keeping only the first 7 characters causes collisions, which must then be resolved.</p></div></details>
+  <details class="qa"><summary>How does hash + collision resolution handle a collision, and what makes it slow?</summary><div><p>It appends a predefined string to the long URL and hashes again, repeating until the code doesn't exist in the DB. Checking the DB on every request is expensive; a bloom filter speeds up the membership test.</p></div></details>
+  <details class="qa"><summary>Convert 11157 to base 62.</summary><div><p>11157 = 2 × 62² + 55 × 62 + 59 → [2, 55, 59] → <b>2TX</b>, since 55 = T and 59 = X.</p></div></details>
+  <details class="qa"><summary>Compare hash + collision resolution with base 62 conversion.</summary><div><ul><li>Length: fixed vs grows with the ID.</li><li>Unique ID generator: not needed vs required.</li><li>Collisions: possible vs impossible.</li><li>Next URL guessable: no vs yes if IDs increment by 1 (a security concern).</li></ul></div></details>
+  <details class="qa"><summary>Walk through the URL shortening flow.</summary><div><p>If the longURL is already in the DB, return its shortURL. Otherwise get a new ID from the unique ID generator, convert it to base 62, and save (id, shortURL, longURL).</p></div></details>
+  <details class="qa"><summary>Walk through the redirect flow. What happens if the short URL isn't found?</summary><div><p>Load balancer → web server → cache; on a miss, read the database; then return the longURL. If it's not in the database either, the user probably entered an invalid shortURL.</p></div></details>
+  <details class="qa"><summary>Name the wrap-up talking points.</summary><div><p>Rate limiter (against floods of shortening requests), web server scaling (stateless tier), database replication and sharding, analytics, and availability/consistency/reliability.</p></div></details>
+</section>
+
+<section id="glossary">
+  <h2>Terms to know</h2>
+  <dl class="glossary">
+    <dt>hashValue</dt><dd>The short code after the domain, e.g. <code>zn9edcu</code> in <code>tinyurl.com/zn9edcu</code>.</dd>
+    <dt>301 redirect</dt><dd>"Moved permanently": the browser caches it and goes straight to the long URL next time.</dd>
+    <dt>302 redirect</dt><dd>"Moved temporarily": every request comes back to the shortener first.</dd>
+    <dt>Base 62</dt><dd>A number system with 62 symbols (0-9, a-z, A-Z) used to write an ID as a short code.</dd>
+    <dt>Hash collision</dt><dd>Two different inputs that produce the same (truncated) hash value.</dd>
+    <dt>CRC32 / MD5 / SHA-1</dt><dd>Well-known hash functions with 8, 32 and 40 hex-character outputs.</dd>
+    <dt>Bloom filter</dt><dd>A space-efficient probabilistic structure for testing whether an element is in a set.</dd>
+    <dt>Unique ID generator</dt><dd>A service that issues globally unique IDs across many servers (Chapter 7).</dd>
+    <dt>Rate limiter</dt><dd>Caps how many requests a client can send, e.g. per IP address (Chapter 4).</dd>
+  </dl>
+  <details class="more refs"><summary>Book references (go deeper)</summary><div><ol>
+    <li><a href="https://www.restapitutorial.com/index.html">A RESTful Tutorial</a></li>
+    <li><a href="https://en.wikipedia.org/wiki/Bloom_filter">Bloom filter</a></li>
+  </ol></div></details>
+</section>
+
+</main>
+<script>
+(function () {
+  var A = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  var $ = function (id) { return document.getElementById(id); };
+  var out = $("b62-out");
+  function fmt(n) { return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ","); }
+  function encode() {
+    var s = $("b62-id").value.trim().replace(/,/g, "");
+    if (!/^\d{1,30}$/.test(s)) { out.textContent = "Enter a whole number (digits only)."; return; }
+    var n = BigInt(s), rows = [], code = "";
+    if (n === 0n) code = "0";
+    while (n > 0n) {
+      var q = n / 62n, r = n % 62n, c = A[Number(r)];
+      rows.push(n + " ÷ 62 = " + q + " remainder <b>" + r + "</b> → <b>" + c + "</b>");
+      code = c + code; n = q;
+    }
+    out.innerHTML = (rows.length ? rows.join("<br>") + "<br>Read the remainders bottom-up: " : "") +
+      "short code <b>" + code + "</b> (" + code.length + " character" + (code.length > 1 ? "s" : "") + ") → tinyurl.com/" + code +
+      (code.length > 7 ? "<br>Longer than 7 characters because the ID is ≥ 62<sup>7</sup> = 3,521,614,606,208." : "");
+    $("b62-code").value = code;
+  }
+  function decode() {
+    var s = $("b62-code").value.trim();
+    if (!/^[0-9a-zA-Z]{1,20}$/.test(s)) { out.textContent = "Use only 0-9, a-z and A-Z (up to 20 characters)."; return; }
+    var n = 0n, terms = [];
+    for (var i = 0; i < s.length; i++) {
+      var v = A.indexOf(s[i]);
+      n = n * 62n + BigInt(v);
+      terms.push(s[i] + " = " + v + " × 62<sup>" + (s.length - 1 - i) + "</sup>");
+    }
+    out.innerHTML = terms.join("<br>") + "<br>Sum = <b>" + fmt(n) + "</b>";
+    $("b62-id").value = n.toString();
+  }
+  $("b62-enc").onclick = encode;
+  $("b62-dec").onclick = decode;
+  $("b62-p1").onclick = function () { $("b62-id").value = "11157"; encode(); };
+  $("b62-p2").onclick = function () { $("b62-id").value = "2009215674938"; encode(); };
+  encode();
+})();
+</script>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 3 · A Framework for System Design Interviews — SDI Fast Track</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem("sdi:theme");if(t)document.documentElement.dataset.theme=JSON.parse(t)}catch(e){}</script>
+</head>
+<body data-root=".." data-chapter="3">
+<main id="content" class="chapter">
+
+<header class="chapter-hero">
+  <p class="eyebrow">Chapter 3 · Foundations</p>
+  <h1>A Framework for System Design Interviews</h1>
+  <p class="lede">The four-step script every design chapter in this book follows (scope, high-level design, deep dive, wrap-up), what the interviewer is actually scoring, and how to split a 45-minute session.</p>
+  <div class="meta-row"></div>
+  <ul class="pace">
+    <li><a href="#tldr">⚡ TL;DR <small>2 min</small></a></li>
+    <li><a href="#skeleton">🗣 Interview answer <small>2 min</small></a></li>
+    <li><a href="#what-it-tests">📖 Full walkthrough</a></li>
+    <li><a href="#self-test">🧠 Self-test</a></li>
+  </ul>
+</header>
+
+<section id="tldr" class="tldr">
+  <h2>TL;DR</h2>
+  <ul>
+    <li><b>What it simulates:</b> two co-workers solving an ambiguous problem together. There's no perfect answer; the <b>process</b> counts more than the final design.</li>
+    <li><b>What's scored:</b> design skill, collaboration, working under pressure, resolving ambiguity, and <b>asking good questions</b>.</li>
+    <li><b>Red flags:</b> over-engineering (design purity over trade-offs), narrow-mindedness, stubbornness.</li>
+    <li><b>Step 1 · Scope:</b> don't jump to a solution. Ask about features, users, growth and tech stack; write assumptions down.</li>
+    <li><b>Step 2 · High-level design:</b> box diagram, back-of-the-envelope check, a few use cases, and the interviewer's agreement.</li>
+    <li><b>Step 3 · Deep dive:</b> prioritize components with the interviewer; skip details that don't show you can design a scalable system.</li>
+    <li><b>Step 4 · Wrap up:</b> bottlenecks and improvements, recap, error cases, operations, the next scale curve.</li>
+    <li><b>Throughout:</b> think out loud, offer multiple approaches, ask for hints when stuck. You're done only when the interviewer says so.</li>
+  </ul>
+  <div class="stats">
+    <div class="stat"><b>3–10 min</b><span>Step 1 · Understand the problem, set scope</span></div>
+    <div class="stat"><b>10–15 min</b><span>Step 2 · High-level design &amp; buy-in</span></div>
+    <div class="stat"><b>10–25 min</b><span>Step 3 · Design deep dive</span></div>
+    <div class="stat"><b>3–5 min</b><span>Step 4 · Wrap up</span></div>
+  </div>
+</section>
+
+<section id="skeleton">
+  <h2>Interview answer skeleton</h2>
+  <p class="one-liner">Use this script for every design question. The design chapters that follow are written in these four steps. Times are for a 45-minute session.</p>
+  <ol class="framework">
+    <li><b>Understand the problem and establish scope (≈3–10 min)</b> Don't answer yet. Ask which features, how many users, the expected scale in 3, 6 and 12 months, and which existing stack or services you can reuse. Write every answer and assumption on the board.</li>
+    <li><b>Propose a high-level design and get buy-in (≈10–15 min)</b> Draw boxes (clients, APIs, web servers, data stores, cache, CDN, message queue), check the scale with quick estimates, walk through a few use cases, and ask for feedback.</li>
+    <li><b>Design deep dive (≈10–25 min)</b> Agree with the interviewer which components matter most, design the most critical first, and avoid details that don't show scalable-design skill.</li>
+    <li><b>Wrap up (≈3–5 min)</b> Recap; name bottlenecks and improvements (never "it's perfect"); cover error cases, monitoring and rollout, the next 10× of users, and refinements you'd make with more time.</li>
+  </ol>
+</section>
+
+<section id="what-it-tests">
+  <h2>What the interview evaluates</h2>
+  <p class="one-liner">It simulates <b>two co-workers collaborating on an ambiguous problem</b>. How you get there matters more than where you end up.</p>
+  <p>The questions are vague ("design well-known product X") and seem unreasonably broad. Nobody expects you to design in an hour what took hundreds or thousands of engineers to build: Google search looks simple, but the technology underneath it is enormous.</p>
+  <p>Instead, the interview is open-ended with <b>no perfect answer</b>. The final design matters less than the work you put into the design process: showing design skill, <b>defending your choices</b>, and <b>responding to feedback</b> constructively.</p>
+  <p>The interviewer's goal is to assess your abilities accurately. Their worst outcome is an inconclusive evaluation because the session went poorly and produced too few <b>signals</b>.</p>
+  <p>Every interview is different and there's no one-size-fits-all solution, but the same four steps apply to all of them.</p>
+  <div class="pros-cons">
+    <div class="pros"><h4>What they look for</h4><ul>
+      <li>Technical design skill</li>
+      <li>Ability to collaborate</li>
+      <li>Working under pressure</li>
+      <li>Resolving ambiguity constructively</li>
+      <li>Asking good questions (many interviewers look for this specifically)</li>
+    </ul></div>
+    <div class="cons"><h4>Red flags</h4><ul>
+      <li><b>Over-engineering:</b> delighting in design purity and ignoring trade-offs, unaware of the compounding costs of over-engineered systems. Many companies pay a high price for it.</li>
+      <li>Narrow-mindedness</li>
+      <li>Stubbornness</li>
+    </ul></div>
+  </div>
+  <aside class="callout key">
+    <span class="callout-label">Key idea</span>
+    <p>Your job is to <b>produce signals</b>. Every good question, named trade-off and defended decision is evidence the interviewer can write down. Silence and trivia give them nothing.</p>
+  </aside>
+</section>
+
+<section id="step-1">
+  <h2><span class="step-num">Step 1</span>Understand the problem and establish design scope</h2>
+  <p class="one-liner"><b>Don't answer yet.</b> Ask questions until you know exactly what to build, and write down every assumption.</p>
+  <p>The book's cautionary tale is Jimmy, the student whose hand always shoots up first, whether or not he knows the answer. <b>Don't be like Jimmy.</b></p>
+  <ul>
+    <li>A fast answer without thinking earns no bonus points. Answering without understanding the requirements is a <b>huge red flag</b>: this isn't a trivia contest, and there is no right answer.</li>
+    <li>Engineers like to jump straight to the final design, which is how you end up designing the wrong system. Slow down, think deeply, and ask questions to clarify requirements and assumptions.</li>
+    <li>One of the most important engineering skills is asking the right questions, making proper assumptions, and gathering the information needed to build a system. Don't be afraid to ask.</li>
+  </ul>
+  <p>When you ask a question, the interviewer either answers it or asks you to make your own assumptions. If it's the latter, <b>write your assumptions on the whiteboard or paper</b>. You might need them later.</p>
+  <h4>Questions to start with</h4>
+  <ul>
+    <li>What specific features are we going to build?</li>
+    <li>How many users does the product have?</li>
+    <li>How fast does the company expect to scale up? What's the anticipated scale in 3 months, 6 months and a year?</li>
+    <li>What is the company's technology stack? Which existing services could you leverage to simplify the design?</li>
+  </ul>
+
+  <h3>Example: design a news feed system</h3>
+  <table class="qa-table">
+    <tr><th>You ask</th><th>Interviewer says</th></tr>
+    <tr><td>Is this a mobile app, a web app, or both?</td><td>Both.</td></tr>
+    <tr><td>What are the most important features?</td><td>Making a post and seeing friends' news feed.</td></tr>
+    <tr><td>Is the feed sorted in reverse chronological order or a particular order? (A particular order weights each post, e.g. posts from close friends rank above posts from a group.)</td><td>To keep things simple, assume reverse chronological order.</td></tr>
+    <tr><td>How many friends can a user have?</td><td>5,000.</td></tr>
+    <tr><td>What is the traffic volume?</td><td>10 million daily active users (DAU).</td></tr>
+    <tr><td>Can the feed contain images and videos, or just text?</td><td>It can contain media files, both images and videos.</td></tr>
+  </table>
+  <h4>Scope you've now pinned down</h4>
+  <ul class="checklist">
+    <li>Web and mobile clients</li>
+    <li>Features: publish a post; view friends' news feed</li>
+    <li>Feed in reverse chronological order</li>
+    <li>Up to 5,000 friends per user</li>
+    <li>10 million DAU</li>
+    <li>Posts may contain images and videos</li>
+  </ul>
+</section>
+
+<section id="step-2">
+  <h2><span class="step-num">Step 2</span>Propose high-level design and get buy-in</h2>
+  <p class="one-liner">Sketch a blueprint and <b>reach agreement with the interviewer</b> on it before going deeper.</p>
+  <ul>
+    <li><b>Propose an initial blueprint and ask for feedback.</b> Treat the interviewer as a teammate and work together; many good interviewers love to talk and get involved.</li>
+    <li><b>Draw box diagrams</b> of the key components on the whiteboard or paper: clients (mobile/web), APIs, web servers, data stores, cache, CDN, message queue, etc.</li>
+    <li><b>Do back-of-the-envelope calculations</b> (<a href="02-back-of-the-envelope.html">Chapter 2</a>) to check the blueprint fits the scale constraints. Think out loud, and check with the interviewer whether the estimate is needed before diving in.</li>
+    <li><b>Walk through a few concrete use cases</b> if possible. They help frame the design and often reveal edge cases you haven't considered yet.</li>
+  </ul>
+  <h4>Include API endpoints and database schema at this stage?</h4>
+  <table>
+    <tr><th>Problem</th><th>Endpoints &amp; schema now?</th></tr>
+    <tr><td>Large, e.g. "Design Google search engine"</td><td><span class="no">✗</span> Too low-level</td></tr>
+    <tr><td>Narrower, e.g. the backend for a multiplayer poker game</td><td><span class="yes">✓</span> Fair game</td></tr>
+  </table>
+  <p>It depends on the problem, so ask the interviewer.</p>
+
+  <h3>Example: news feed high-level design</h3>
+  <p>You don't need to understand how the system works yet; <a href="11-news-feed.html">Chapter 11</a> covers the details. At a high level the design splits into two flows:</p>
+  <ul>
+    <li><b>Feed publishing:</b> when a user publishes a post, its data is written to the cache and database, and the post is populated into friends' news feeds.</li>
+    <li><b>News feed building:</b> a user's feed is built by aggregating friends' posts in reverse chronological order.</li>
+  </ul>
+  <div class="fig-row">
+    <figure class="fig">
+      <img src="../assets/img/p-045-030.jpg" alt="Feed publishing: web browser or mobile app calls v1/me/feed with content and auth_token through a load balancer to web servers, which call a post service backed by post cache and post DB, a fanout service backed by a news feed cache, and a notification service">
+      <figcaption><b>Figure 3-1</b> · Feed publishing. <code>v1/me/feed?content=Hello&amp;auth_token={auth_token}</code> → load balancer → web servers, which call the post service (post cache → post DB), the fanout service (news feed cache) and the notification service.</figcaption>
+    </figure>
+    <figure class="fig">
+      <img src="../assets/img/p-046-031.jpg" alt="News feed building: client calls v1/me/feed through a load balancer to web servers, then a news feed service that reads from a news feed cache">
+      <figcaption><b>Figure 3-2</b> · News feed building. <code>v1/me/feed</code> → load balancer → web servers → news feed service, which reads the news feed cache.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section id="step-3">
+  <h2><span class="step-num">Step 3</span>Design deep dive</h2>
+  <p class="one-liner">With the interviewer, <b>pick the components that matter most</b> and go deep on them while watching the clock.</p>
+  <h4>Before you start, you should have</h4>
+  <ul class="checklist">
+    <li>Agreed on the overall goals and feature scope</li>
+    <li>Sketched a high-level blueprint for the overall design</li>
+    <li>Got the interviewer's feedback on that design</li>
+    <li>Some initial ideas, based on that feedback, about which areas to focus on</li>
+  </ul>
+  <p>Work with the interviewer to <b>identify and prioritize</b> components in the architecture. Every interview is different:</p>
+  <table>
+    <tr><th>What you notice</th><th>Where to focus</th></tr>
+    <tr><td>The interviewer hints they like high-level design</td><td>Stay at the high level</td></tr>
+    <tr><td>Senior candidate interview</td><td>System performance characteristics: bottlenecks and resource estimations</td></tr>
+    <tr><td>Most cases</td><td>Details of a few components. URL shortener: the hash function that turns a long URL into a short one. Chat system: reducing latency, and supporting online/offline status.</td></tr>
+  </table>
+  <aside class="callout warn">
+    <span class="callout-label">Pitfall</span>
+    <p>Time management is essential. It's easy to get carried away with minute details that don't demonstrate your abilities. Explaining Facebook's EdgeRank feed-ranking algorithm in detail, for example, eats precious time and doesn't prove you can design a scalable system. Come armed with signals to show instead.</p>
+  </aside>
+
+  <h3>Example: news feed deep dive</h3>
+  <p>The interviewer is happy with the high-level design, so you investigate the two most important use cases: <b>feed publishing</b> and <b>news feed retrieval</b>. <a href="11-news-feed.html">Chapter 11</a> explains both in detail.</p>
+  <figure class="fig">
+    <img src="../assets/img/p-048-032.jpg" alt="Detailed feed publishing: web servers with authentication and rate limiting call the post service, notification service and fanout service; the fanout service gets friend ids from a graph DB, gets friends data from user cache and user DB, puts work on a message queue consumed by fanout workers that write to the news feed cache">
+    <figcaption><b>Figure 3-3</b> · Feed publishing in detail. Web servers now do authentication and rate limiting. The fanout service (1) gets friend IDs from a graph DB, (2) gets friends' data from the user cache/DB and (3) puts work on a message queue; (4) fanout workers pick it up and (5) write to the news feed cache.</figcaption>
+  </figure>
+  <figure class="fig">
+    <img src="../assets/img/p-049-033.jpg" alt="Detailed news feed retrieval: client calls /v1/me/feed through load balancer to web servers with authentication and rate limiting, then news feed service reads news feed cache and fetches from user cache and DB and post cache and DB, then returns to the client; media is served from a CDN">
+    <figcaption><b>Figure 3-4</b> · News feed retrieval in detail. (1) <code>/v1/me/feed</code> → load balancer → (2) web servers → (3) news feed service, which (4) reads the news feed cache and (5) fetches user and post data from their caches/DBs; (6) the feed goes back to the client. Media comes from the CDN.</figcaption>
+  </figure>
+</section>
+
+<section id="step-4">
+  <h2><span class="step-num">Step 4</span>Wrap up</h2>
+  <p class="one-liner">The interviewer may ask follow-ups or let you choose topics. <b>Never claim the design is perfect.</b></p>
+  <ul>
+    <li><b>Bottlenecks and improvements.</b> You may be asked to identify the system's bottlenecks and discuss improvements. There is always something to improve, and this is your chance to show critical thinking and leave a good final impression.</li>
+    <li><b>Recap your design.</b> Especially useful if you suggested several solutions; it refreshes the interviewer's memory after a long session.</li>
+    <li><b>Error cases:</b> server failure, network loss, etc.</li>
+    <li><b>Operational issues:</b> how you monitor metrics and error logs, and how you roll out the system.</li>
+    <li><b>The next scale curve:</b> if the design supports 1 million users, what changes to support 10 million?</li>
+    <li><b>Other refinements</b> you'd make with more time.</li>
+  </ul>
+  <aside class="callout tip">
+    <span class="callout-label">Say this in the interview</span>
+    <p>"The first bottleneck I'd expect is ___, and I'd fix it with ___. To go from 1 million to 10 million users I'd change ___. With more time I'd add monitoring for ___ and roll this out gradually."</p>
+  </aside>
+</section>
+
+<section id="dos-donts">
+  <h2>Dos and don'ts</h2>
+  <p class="one-liner">The whole chapter as a checklist.</p>
+  <div class="pros-cons">
+    <div class="pros"><h4>Do</h4><ul>
+      <li>Always ask for clarification. Don't assume your assumption is correct.</li>
+      <li>Understand the requirements of the problem.</li>
+      <li>Remember there is no right or best answer: a design for a young startup differs from one for an established company with millions of users. Make sure you understand the requirements.</li>
+      <li>Let the interviewer know what you're thinking. Communicate.</li>
+      <li>Suggest multiple approaches if possible.</li>
+      <li>Once you agree on the blueprint, go into detail on each component. Design the most critical components first.</li>
+      <li>Bounce ideas off the interviewer. A good interviewer works with you as a teammate.</li>
+      <li>Never give up.</li>
+    </ul></div>
+    <div class="cons"><h4>Don't</h4><ul>
+      <li>Be unprepared for typical interview questions.</li>
+      <li>Jump into a solution without clarifying the requirements and assumptions.</li>
+      <li>Go into too much detail on a single component at the beginning. Give the high-level design first, then drill down.</li>
+      <li>Hesitate to ask for hints if you get stuck.</li>
+      <li>Think in silence. Again: communicate.</li>
+      <li>Think the interview is done once you give the design. You're not done until the interviewer says so. Ask for feedback early and often.</li>
+    </ul></div>
+  </div>
+</section>
+
+<section id="time-allocation">
+  <h2>Time allocation for a 45-minute session</h2>
+  <p class="one-liner">A rough guide: <b>the deep dive gets the most time</b>. Adjust to the problem's scope and what the interviewer asks for.</p>
+  <p>Design questions are broad, and 45 minutes or an hour isn't enough to cover an entire design, so time management is essential.</p>
+  <table>
+    <tr><th>Step</th><th>Time</th></tr>
+    <tr><td><a href="#step-1">1 · Understand the problem and establish design scope</a></td><td>3–10 min</td></tr>
+    <tr><td><a href="#step-2">2 · Propose high-level design and get buy-in</a></td><td>10–15 min</td></tr>
+    <tr><td><a href="#step-3">3 · Design deep dive</a></td><td>10–25 min</td></tr>
+    <tr><td><a href="#step-4">4 · Wrap up</a></td><td>3–5 min</td></tr>
+  </table>
+</section>
+
+<section id="self-test">
+  <h2>Self-test</h2>
+  <details class="qa"><summary>What does a system design interview simulate, and what matters more than the final design?</summary><div><p>Two co-workers collaborating on an ambiguous problem to reach a solution that meets their goals. The design process matters more: showing design skill, defending your choices and responding to feedback constructively.</p></div></details>
+  <details class="qa"><summary>Besides technical design skill, what signals is the interviewer looking for?</summary><div><p>Ability to collaborate, to work under pressure, to resolve ambiguity constructively, and to ask good questions.</p></div></details>
+  <details class="qa"><summary>Name three red flags. Why is over-engineering one of them?</summary><div><p>Over-engineering, narrow-mindedness and stubbornness. Over-engineering chases design purity, ignores trade-offs and the compounding costs of complex systems, and companies pay a high price for it.</p></div></details>
+  <details class="qa"><summary>What's the lesson of "Jimmy" in Step 1?</summary><div><p>Don't answer quickly without understanding the requirements. Speed earns no points and answering without understanding is a huge red flag. Slow down and ask clarifying questions.</p></div></details>
+  <details class="qa"><summary>What four questions does the book suggest to start Step 1?</summary><div><ul><li>What specific features are we building?</li><li>How many users does the product have?</li><li>How fast will it scale (in 3 months, 6 months, a year)?</li><li>What's the tech stack, and which existing services can we leverage?</li></ul></div></details>
+  <details class="qa"><summary>The interviewer says "make your own assumptions." What do you do?</summary><div><p>State them and write them on the whiteboard or paper, because you'll likely need them later.</p></div></details>
+  <details class="qa"><summary>What scope did the news feed clarifying dialogue establish?</summary><div><p>Web and mobile; make a post and see friends' feed; reverse chronological order; up to 5,000 friends; 10 million DAU; posts can contain images and videos.</p></div></details>
+  <details class="qa"><summary>What do you do in Step 2?</summary><div><p>Propose a blueprint and get feedback, treating the interviewer as a teammate; draw a box diagram of key components; run back-of-the-envelope numbers to check the scale (asking first if they're wanted); walk through a few concrete use cases.</p></div></details>
+  <details class="qa"><summary>Should the high-level design include API endpoints and a database schema?</summary><div><p>It depends. For a large problem like "design Google search" it's too low-level; for the backend of a multiplayer poker game it's fair game. Ask the interviewer.</p></div></details>
+  <details class="qa"><summary>What four things should be true before you start the deep dive?</summary><div><p>You've agreed on goals and feature scope, sketched a high-level blueprint, got feedback on it, and have initial ideas from that feedback about which areas to focus on.</p></div></details>
+  <details class="qa"><summary>Give two good deep-dive topics and one bad one.</summary><div><p>Good: the hash function in a URL shortener; reducing latency and online/offline status in a chat system. Bad: explaining Facebook's EdgeRank ranking algorithm in detail, which costs time without showing scalable-design skill.</p></div></details>
+  <details class="qa"><summary>List the wrap-up talking points.</summary><div><p>Bottlenecks and improvements (never call the design perfect), a recap, error cases, operations (metrics, error logs, rollout), the next scale curve (e.g. 1 M → 10 M users), and refinements with more time.</p></div></details>
+  <details class="qa"><summary>How should you split a 45-minute session?</summary><div><p>Step 1: 3–10 min. Step 2: 10–15 min. Step 3: 10–25 min. Step 4: 3–5 min.</p></div></details>
+  <details class="qa"><summary>You're stuck, or you've just finished presenting your design. What should you do?</summary><div><p>If stuck, ask for hints and keep thinking out loud. After presenting, keep going: you're not done until the interviewer says so, so ask for feedback early and often.</p></div></details>
+</section>
+
+<section id="glossary">
+  <h2>Terms to know</h2>
+  <dl class="glossary">
+    <dt>Design scope</dt><dd>The features, users and scale you agree to design for in Step 1.</dd>
+    <dt>Buy-in</dt><dd>The interviewer's agreement with your high-level design before you go deeper.</dd>
+    <dt>Blueprint</dt><dd>The initial high-level box diagram of key components and how requests flow between them.</dd>
+    <dt>Back-of-the-envelope calculation</dt><dd>A quick estimate that checks whether a design fits the scale (<a href="02-back-of-the-envelope.html">Chapter 2</a>).</dd>
+    <dt>Deep dive</dt><dd>Detailed design of the few components the interviewer and you agree matter most.</dd>
+    <dt>Over-engineering</dt><dd>Building for design purity beyond what the requirements need, ignoring trade-offs and compounding costs.</dd>
+    <dt>Signal</dt><dd>Evidence of your abilities the interviewer can record; too few signals means an inconclusive evaluation.</dd>
+    <dt>Fanout</dt><dd>In the news feed example, populating a new post into each friend's news feed (<a href="11-news-feed.html">Chapter 11</a>).</dd>
+    <dt>Scale curve</dt><dd>The next jump in load, e.g. going from 1 million to 10 million users.</dd>
+  </dl>
+</section>
+
+</main>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

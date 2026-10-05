@@ -1,0 +1,552 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 6 · Design a Key-Value Store — SDI Fast Track</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem("sdi:theme");if(t)document.documentElement.dataset.theme=JSON.parse(t)}catch(e){}</script>
+</head>
+<body data-root=".." data-chapter="6">
+<main id="content" class="chapter">
+
+<header class="chapter-hero">
+  <p class="eyebrow">Chapter 6 · Design problem</p>
+  <h1>Design a Key-Value Store</h1>
+  <p class="lede">How to grow a single in-memory hash table into a distributed, highly available store like Dynamo or Cassandra: the CAP trade-off, consistent hashing, quorums, vector clocks, gossip, hinted handoff, Merkle trees, and the write and read paths on each node.</p>
+  <div class="meta-row"></div>
+  <ul class="pace">
+    <li><a href="#tldr">⚡ TL;DR <small>2 min</small></a></li>
+    <li><a href="#skeleton">🗣 Interview answer <small>3 min</small></a></li>
+    <li><a href="#scope">📖 Full walkthrough</a></li>
+    <li><a href="#self-test">🧠 Self-test</a></li>
+  </ul>
+</header>
+
+<section id="tldr" class="tldr">
+  <h2>TL;DR</h2>
+  <ul>
+    <li><b>Goal:</b> <code>put(key, value)</code> and <code>get(key)</code> for small pairs (&lt; 10 KB) at big-data scale, with high availability, automatic scaling, tunable consistency and low latency.</li>
+    <li>One server (an in-memory hash table) fills up fast, so the store must be <b>distributed</b>.</li>
+    <li><b>CAP:</b> network partitions are unavoidable, so choose <b>CP</b> (block writes, like a bank) or <b>AP</b> (keep serving, maybe stale). This design is AP with <b>eventual consistency</b>, like Dynamo and Cassandra.</li>
+    <li><b>Partition</b> with consistent hashing (virtual nodes). <b>Replicate</b> each key on the next <b>N distinct servers</b> clockwise, spread across data centers.</li>
+    <li><b>Quorum:</b> a write waits for <b>W</b> acks, a read for <b>R</b> replies. <b>W + R &gt; N ⇒ strong consistency</b> (usually N = 3, W = R = 2).</li>
+    <li><b>Vector clocks</b> (<code>[server, counter]</code> pairs) detect conflicting versions; the client reconciles them.</li>
+    <li><b>Failures:</b> gossip detects them; sloppy quorum + hinted handoff ride out temporary ones; Merkle-tree anti-entropy repairs permanent ones; cross-data-center replication survives outages.</li>
+    <li><b>Per node (Cassandra-style):</b> write = commit log → memory cache → flush to SSTables. Read = memory cache → bloom filter → SSTables.</li>
+  </ul>
+  <figure class="fig">
+    <img src="../assets/img/p-104-085.jpg" alt="Client sends read/write to coordinator node n6 on a ring of nodes n0 to n7; n6 forwards to replicas n0, n1, n2 and returns the response">
+    <figcaption><b>Figure 6-17</b> · The whole design: any node can coordinate; it forwards to the key's N replicas on the ring.</figcaption>
+  </figure>
+</section>
+
+<section id="skeleton">
+  <h2>Interview answer skeleton</h2>
+  <p class="one-liner">Requirements first, then CAP, then the components one by one. The summary table is your wrap-up.</p>
+  <ol class="framework">
+    <li><b>Clarify (≈5 min)</b> Confirm the API (<code>put</code>, <code>get</code>) and requirements: pairs &lt; 10 KB, big data, high availability, high and automatic scalability, tunable consistency, low latency. Ask whether consistency or availability matters more.</li>
+    <li><b>High-level (≈10 min)</b> A single in-memory hash table runs out of space. Distribute it, explain CAP, choose AP with eventual consistency, and draw the ring of identical nodes with a coordinator.</li>
+    <li><b>Deep dive (≈20 min)</b> Consistent hashing with virtual nodes; N replicas on distinct servers and data centers; quorum N/W/R; vector clocks; gossip; sloppy quorum + hinted handoff; Merkle trees; the write path and read path.</li>
+    <li><b>Wrap up (≈5 min)</b> Walk the goal → technique table: each requirement maps to one technique.</li>
+  </ol>
+</section>
+
+<section id="scope">
+  <h2>Understand the problem and design scope</h2>
+  <p class="one-liner">A key-value store maps <b>unique keys to opaque values</b> through two calls. The hard part is the trade-offs the requirements force.</p>
+  <p>A <b>key-value store</b> (key-value database) is a non-relational database: each unique key is stored with a value, and the value is accessed through its key.</p>
+  <ul>
+    <li><b>Keys:</b> plain text (<code>"last_logged_in_at"</code>) or hashed (<code>253DDEC4</code>). Short keys perform better.</li>
+    <li><b>Values:</b> strings, lists, objects, etc. Dynamo, Memcached and Redis usually treat the value as an <b>opaque object</b>.</li>
+    <li><b>Example data (Table 6-1):</b> <code>145 → john</code>, <code>147 → bob</code>, <code>160 → Julia</code>.</li>
+  </ul>
+  <p>You are asked to support two operations:</p>
+<pre><code>put(key, value) // insert "value" associated with "key"
+get(key)        // get "value" associated with "key"</code></pre>
+  <p>There is no perfect design: each one balances <b>read, write and memory usage</b>, and <b>consistency vs availability</b>. This store should have:</p>
+  <ul class="checklist">
+    <li>Small key-value pairs: less than 10 KB</li>
+    <li>Ability to store big data</li>
+    <li>High availability: responds quickly, even during failures</li>
+    <li>High scalability: scales to support a large data set</li>
+    <li>Automatic scaling: servers are added or removed automatically based on traffic</li>
+    <li>Tunable consistency</li>
+    <li>Low latency</li>
+  </ul>
+</section>
+
+<section id="single-server">
+  <h2>Single-server key-value store</h2>
+  <p class="one-liner">Easy to build as an <b>in-memory hash table</b>, but one machine runs out of room quickly.</p>
+  <p>Memory access is fast, but fitting everything in memory may be impossible. Two optimizations fit more data on one server:</p>
+  <ul>
+    <li><b>Data compression</b></li>
+    <li>Keep only <b>frequently used data in memory</b> and the rest on disk</li>
+  </ul>
+  <p>Even so, a single server reaches capacity very quickly. Big data needs a <b>distributed</b> key-value store.</p>
+</section>
+
+<section id="cap">
+  <h2>Distributed key-value store: the CAP theorem</h2>
+  <p class="one-liner">Once data lives on many nodes, network partitions will happen, and then you must <b>choose consistency or availability</b>.</p>
+  <p>A distributed key-value store, also called a <b>distributed hash table</b>, spreads key-value pairs across many servers. The <b>CAP theorem</b> says a distributed system can't provide more than two of these three at once:</p>
+  <table>
+    <tr><th>Property</th><th>Meaning</th></tr>
+    <tr><td><b>Consistency</b></td><td>All clients see the same data at the same time, no matter which node they connect to.</td></tr>
+    <tr><td><b>Availability</b></td><td>Any client that requests data gets a response, even if some nodes are down.</td></tr>
+    <tr><td><b>Partition tolerance</b></td><td>A partition is a communication break between two nodes. The system keeps operating despite network partitions.</td></tr>
+  </table>
+  <figure class="fig small">
+    <img src="../assets/img/p-090-069.jpg" alt="Venn diagram of Consistency, Availability and Partition Tolerance with overlaps labeled CA, CP and AP">
+    <figcaption><b>Figure 6-1</b> · Each overlap names a system type by the two properties it keeps.</figcaption>
+  </figure>
+  <table>
+    <tr><th>Type</th><th>Keeps</th><th>Sacrifices</th><th>Exists in practice?</th></tr>
+    <tr><td><b>CP</b></td><td>Consistency + partition tolerance</td><td>Availability</td><td class="yes">✓</td></tr>
+    <tr><td><b>AP</b></td><td>Availability + partition tolerance</td><td>Consistency</td><td class="yes">✓</td></tr>
+    <tr><td><b>CA</b></td><td>Consistency + availability</td><td>Partition tolerance</td><td class="no">✗ Network failure is unavoidable, so a distributed system must tolerate partitions.</td></tr>
+  </table>
+
+  <h3>Example: three replicas</h3>
+  <p>Data is usually replicated several times. Take three replicas, n1, n2 and n3.</p>
+  <div class="fig-row">
+    <figure class="fig small">
+      <img src="../assets/img/p-091-070.jpg" alt="Three connected replica nodes n1, n2 and n3">
+      <figcaption><b>Figure 6-2</b> · Ideal: no partition. A write to n1 reaches n2 and n3, so you get both C and A.</figcaption>
+    </figure>
+    <figure class="fig small">
+      <img src="../assets/img/p-092-071.jpg" alt="Replica n3 marked with a red X, cut off from n1 and n2">
+      <figcaption><b>Figure 6-3</b> · Real world: n3 is cut off. Writes to n1/n2 can't reach it; writes on n3 leave n1/n2 stale.</figcaption>
+    </figure>
+  </div>
+  <table>
+    <tr><th>Choice during the partition</th><th>What happens</th></tr>
+    <tr><td><b>CP</b> (consistency over availability)</td><td>Block all writes to n1 and n2 so the three servers can't diverge. The system is unavailable. Banks work this way: the balance must be up to date, so they return an error until the inconsistency is resolved.</td></tr>
+    <tr><td><b>AP</b> (availability over consistency)</td><td>Keep accepting reads, even if stale. n1 and n2 keep accepting writes, and n3 is synced when the partition heals.</td></tr>
+  </table>
+  <aside class="callout tip">
+    <span class="callout-label">Say this in the interview</span>
+    <p>"Partitions will happen, so the real choice is consistency or availability during one. Which matters more for this use case?" Agree on it with the interviewer, then design accordingly.</p>
+  </aside>
+</section>
+
+<section id="partition">
+  <h2>Data partition</h2>
+  <p class="one-liner">Split the data across servers with <b>consistent hashing</b>, so it's spread evenly and little of it moves when servers change.</p>
+  <p>This and the components that follow are largely based on three popular systems: <b>Dynamo, Cassandra and BigTable</b>.</p>
+  <p>The full data set doesn't fit on one server, so split it into partitions. Two challenges: spread data across servers <b>evenly</b>, and <b>minimize data movement</b> when nodes are added or removed. <a href="05-consistent-hashing.html">Consistent hashing</a> (Chapter 5) solves both:</p>
+  <ol class="flow">
+    <li>Place the servers on a <b>hash ring</b>. Figure 6-4 has eight: s0 … s7.</li>
+    <li>Hash the key onto the same ring and store it on the <b>first server clockwise</b>. key0 goes to s1.</li>
+  </ol>
+  <figure class="fig small">
+    <img src="../assets/img/p-093-072.jpg" alt="Hash ring with servers s0 to s7; key0 sits between s0 and s1 and an arrow points clockwise to s1">
+    <figcaption><b>Figure 6-4</b> · key0 lands just past s0, so s1 stores it.</figcaption>
+  </figure>
+  <p>Advantages of consistent hashing here:</p>
+  <ul>
+    <li><b>Automatic scaling:</b> servers can be added and removed automatically depending on load.</li>
+    <li><b>Heterogeneity:</b> the number of <b>virtual nodes</b> (ring positions) for a server is proportional to its capacity. Bigger servers get more virtual nodes.</li>
+  </ul>
+</section>
+
+<section id="replication">
+  <h2>Data replication</h2>
+  <p class="one-liner">Copy each key to the <b>first N distinct servers clockwise</b> from it, ideally in different data centers.</p>
+  <p>For high availability and reliability, data is replicated <b>asynchronously</b> over <b>N</b> servers (N is configurable): from the key's ring position, walk clockwise and take the first N servers.</p>
+  <figure class="fig small">
+    <img src="../assets/img/p-094-073.jpg" alt="Hash ring where key0's three replicas s1, s2 and s3 are highlighted green">
+    <figcaption><b>Figure 6-5</b> · N = 3: key0 is stored on s1, s2 and s3.</figcaption>
+  </figure>
+  <ul>
+    <li><b>Virtual node catch:</b> the first N ring positions may belong to fewer than N physical servers. Count only <b>unique</b> servers during the walk.</li>
+    <li><b>Correlated failures:</b> nodes in one data center often fail together (power or network outages, natural disasters). Place replicas in <b>distinct data centers</b> linked by high-speed networks.</li>
+  </ul>
+</section>
+
+<section id="consistency">
+  <h2>Consistency: quorum and consistency models</h2>
+  <p class="one-liner">Replicas must be kept in sync. <b>Quorum consensus</b> lets you tune latency against consistency with three numbers: N, W and R.</p>
+  <table>
+    <tr><th>Symbol</th><th>Meaning</th></tr>
+    <tr><td><b>N</b></td><td>Number of replicas.</td></tr>
+    <tr><td><b>W</b></td><td>Write quorum: a write succeeds once <b>W replicas acknowledge</b> it.</td></tr>
+    <tr><td><b>R</b></td><td>Read quorum: a read succeeds once it has <b>responses from at least R replicas</b>.</td></tr>
+  </table>
+  <figure class="fig small">
+    <img src="../assets/img/p-095-074.jpg" alt="Coordinator sends put(key1, val1) to replicas s0, s1 and s2 on the ring; each returns an ACK">
+    <figcaption><b>Figure 6-6</b> · N = 3. The write goes to s0, s1 and s2; W sets how many ACKs the coordinator waits for.</figcaption>
+  </figure>
+  <p>A <b>coordinator</b> is a node that acts as a proxy between the client and the replicas.</p>
+  <aside class="callout warn">
+    <span class="callout-label">Pitfall</span>
+    <p><b>W = 1 does not mean the data is written to one server.</b> It still goes to s0, s1 and s2. The coordinator just calls the write successful after the first ACK (say from s1) and stops waiting for s0 and s2.</p>
+  </aside>
+  <p><b>The trade-off is latency vs consistency.</b> W = 1 or R = 1 returns quickly: the coordinator waits for any one replica. W or R &gt; 1 is more consistent but slower, because the coordinator must wait for the slowest replica.</p>
+  <table>
+    <tr><th>Configuration</th><th>Result</th></tr>
+    <tr><td>R = 1, W = N</td><td>Optimized for <b>fast reads</b></td></tr>
+    <tr><td>W = 1, R = N</td><td>Optimized for <b>fast writes</b></td></tr>
+    <tr><td>W + R &gt; N</td><td><b>Strong consistency guaranteed</b> (usually N = 3, W = R = 2)</td></tr>
+    <tr><td>W + R ≤ N</td><td>Strong consistency <b>not</b> guaranteed</td></tr>
+  </table>
+  <aside class="callout key">
+    <span class="callout-label">Key idea</span>
+    <p>If W + R &gt; N, every read quorum shares <b>at least one node</b> with every write quorum, and that node has the latest data. With N = 3, W = R = 2, the overlap is at least 2 + 2 − 3 = 1.</p>
+  </aside>
+
+  <div class="demo" id="quorum-demo">
+    <span class="demo-title">Try it · Quorum explorer</span>
+    <p style="font-size:15px;margin-bottom:10px">Set N, W and R. The boxes show the worst case: the write is acknowledged by the first W replicas, and the read hears from the last R. Green boxes are in both sets.</p>
+    <div style="display:flex;flex-wrap:wrap;gap:6px 18px;align-items:center;margin-bottom:10px">
+      <label>N = <b id="q-nv">3</b> <input id="q-n" type="range" min="1" max="7" value="3" style="padding:0;vertical-align:middle"></label>
+      <label>W = <b id="q-wv">2</b> <input id="q-w" type="range" min="1" max="3" value="2" style="padding:0;vertical-align:middle"></label>
+      <label>R = <b id="q-rv">2</b> <input id="q-r" type="range" min="1" max="3" value="2" style="padding:0;vertical-align:middle"></label>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px">
+      <button class="btn" type="button" data-q="3,2,2">N 3 · W 2 · R 2</button>
+      <button class="btn" type="button" data-q="3,3,1">Fast read</button>
+      <button class="btn" type="button" data-q="3,1,3">Fast write</button>
+      <button class="btn" type="button" data-q="3,1,1">W 1 · R 1</button>
+    </div>
+    <div id="q-boxes" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px"></div>
+    <div class="out" id="q-out" style="line-height:1.7"></div>
+  </div>
+
+  <h3>Consistency models</h3>
+  <p>A <b>consistency model</b> defines the degree of data consistency, on a wide spectrum:</p>
+  <table>
+    <tr><th>Model</th><th>Guarantee</th></tr>
+    <tr><td><b>Strong</b></td><td>Every read returns the most recent write. A client never sees out-of-date data.</td></tr>
+    <tr><td><b>Weak</b></td><td>Later reads may not see the most recent value.</td></tr>
+    <tr><td><b>Eventual</b></td><td>A form of weak consistency: given enough time, all updates propagate and all replicas agree.</td></tr>
+  </table>
+  <p>Strong consistency usually means a replica refuses new reads/writes until every replica agrees on the current write. That can block operations, which is bad for high availability.</p>
+  <p><b>This design uses eventual consistency, like Dynamo and Cassandra.</b> Concurrent writes can then let inconsistent values into the system, and the client must read and reconcile them, using versioning.</p>
+</section>
+
+<section id="versioning">
+  <h2>Inconsistency resolution: versioning and vector clocks</h2>
+  <p class="one-liner"><b>Versioning</b> treats every modification as a new immutable version. A <b>vector clock</b> on each version tells "newer" from "conflicting".</p>
+  <p>Replication gives high availability but causes inconsistencies among replicas.</p>
+
+  <h3>How a conflict happens</h3>
+  <div class="fig-row">
+    <figure class="fig">
+      <img src="../assets/img/p-097-075.jpg" alt="Server 1 reads name from n1 and server 2 reads name from n2; both return john">
+      <figcaption><b>Figure 6-7</b> · Both replicas hold the original value, <code>john</code>.</figcaption>
+    </figure>
+    <figure class="fig">
+      <img src="../assets/img/p-097-076.jpg" alt="Server 1 writes johnSanFrancisco to n1 while server 2 writes johnNewYork to n2">
+      <figcaption><b>Figure 6-8</b> · Simultaneous writes create two versions: v1 on n1, v2 on n2.</figcaption>
+    </figure>
+  </div>
+  <p>The original value can be ignored, since both changes were based on it. But nothing says whether v1 (<code>johnSanFrancisco</code>) or v2 (<code>johnNewYork</code>) should win. You need a versioning system that can <b>detect</b> and <b>reconcile</b> conflicts.</p>
+
+  <h3>Vector clocks</h3>
+  <p>A <b>vector clock</b> is a set of <code>[server, version]</code> pairs attached to a data item. It shows whether one version precedes, succeeds, or conflicts with another. Notation: <code>D([S1, v1], …, [Sn, vn])</code>, where Si is a server and vi its version counter. When D is written to server Si:</p>
+  <ul>
+    <li>If <code>[Si, vi]</code> exists, increment vi.</li>
+    <li>Otherwise, create a new entry <code>[Si, 1]</code>.</li>
+  </ul>
+  <figure class="fig medium">
+    <img src="../assets/img/p-098-077.jpg" alt="Version graph: D1([Sx,1]) to D2([Sx,2]), which branches into D3([Sx,2],[Sy,1]) and D4([Sx,2],[Sz,1]), which merge into D5([Sx,3],[Sy,1],[Sz,1])">
+    <figcaption><b>Figure 6-9</b> · Versions branch at D2 (Sy and Sz both updated it) and merge again at D5.</figcaption>
+  </figure>
+  <ol class="flow">
+    <li>A client writes <b>D1</b>, handled by Sx → <code>D1([Sx, 1])</code>.</li>
+    <li>A client reads D1, updates it to <b>D2</b>, writes it back via Sx → <code>D2([Sx, 2])</code>. D2 descends from D1, so it overwrites D1.</li>
+    <li>A client reads D2, updates it to <b>D3</b>, written via Sy → <code>D3([Sx, 2], [Sy, 1])</code>.</li>
+    <li>Another client also reads D2, updates it to <b>D4</b>, written via Sz → <code>D4([Sx, 2], [Sz, 1])</code>.</li>
+    <li>A client reads D3 and D4 and finds a <b>conflict</b>: D2 was modified by both Sy and Sz. The client resolves it and writes the result via Sx → <code>D5([Sx, 3], [Sy, 1], [Sz, 1])</code>.</li>
+  </ol>
+
+  <h4>Ancestor or conflict?</h4>
+  <table>
+    <tr><th>Relation</th><th>Rule</th><th>Example</th></tr>
+    <tr><td>X is an <b>ancestor</b> of Y (no conflict)</td><td>Every counter in Y is ≥ the matching counter in X</td><td><code>D([s0, 1], [s1, 1])</code> is an ancestor of <code>D([s0, 1], [s1, 2])</code></td></tr>
+    <tr><td>X and Y are <b>siblings</b> (conflict)</td><td>Some counter in Y is less than X's, <i>and</i> some counter in X is less than Y's</td><td><code>D([s0, 1], [s1, 2])</code> vs <code>D([s0, 2], [s1, 1])</code></td></tr>
+  </table>
+  <aside class="callout warn">
+    <span class="callout-label">Pitfall</span>
+    <p>The book states the conflict test one way only ("some counter in Y is less than X's"). That alone allows X to descend from Y. A conflict needs it <b>both ways</b>, with a missing server counted as 0. D3 is ahead on Sy and D4 on Sz, so they conflict. D5 is ≥ both everywhere, so it supersedes them.</p>
+  </aside>
+
+  <h4>Downsides</h4>
+  <ul>
+    <li><b>Client complexity:</b> the client must implement conflict-resolution logic.</li>
+    <li><b>Clocks grow:</b> the <code>[server: version]</code> pairs can grow rapidly. Fix: cap the length and drop the <b>oldest pairs</b>. Reconciliation can then be inefficient, because descendant relationships can't be determined accurately. Per the Dynamo paper, Amazon hasn't hit this in production, so it's probably acceptable for most companies.</li>
+  </ul>
+</section>
+
+<section id="failures">
+  <h2>Handling failures</h2>
+  <p class="one-liner">At scale, failures are common. <b>Detect</b> them with gossip, then pick the fix by failure type: temporary, permanent, or a whole data center.</p>
+
+  <h3>Failure detection: gossip protocol</h3>
+  <p>Don't mark a server down just because one other server says so. Usually you need <b>at least two independent sources</b> of information.</p>
+  <p><b>All-to-all multicasting</b> (every server pings every other) is straightforward but inefficient with many servers: n servers send n(n − 1) messages per round.</p>
+  <figure class="fig small">
+    <img src="../assets/img/p-100-078.jpg" alt="Four servers s0 to s3 on a ring with arrows from every server to every other server">
+    <figcaption><b>Figure 6-10</b> · All-to-all: 4 servers already need 4 × 3 = 12 heartbeats.</figcaption>
+  </figure>
+  <p>Better: a decentralized method such as the <b>gossip protocol</b>.</p>
+  <ol class="flow">
+    <li>Each node keeps a <b>membership list</b>: member IDs and heartbeat counters.</li>
+    <li>Each node periodically <b>increments its own heartbeat counter</b>.</li>
+    <li>Each node periodically sends heartbeats to a set of <b>random nodes</b>, which pass them on to another set.</li>
+    <li>Receiving nodes update their membership list to the latest info.</li>
+    <li>If a member's heartbeat hasn't increased for more than a predefined period, it is considered <b>offline</b>.</li>
+  </ol>
+  <figure class="fig">
+    <img src="../assets/img/p-100-079.jpg" alt="s0's membership list shows member 2 with heartbeat counter 9908 last updated 11:58:02, while others are around 10,230 at 12:00; s0 detects s2 is down and gossips to s1 and s3, which forwards to s4 and s5">
+    <figcaption><b>Figure 6-11</b> · In s0's list, member 2's counter is stuck at 9908 (11:58:02) while the others updated around 12:00.</figcaption>
+  </figure>
+  <p>s0 notices that s2 (member ID 2) hasn't increased its heartbeat for a long time, so it sends heartbeats that include s2's info to random nodes. Once other nodes <b>confirm</b> it, s2 is marked down and the news spreads to every node.</p>
+
+  <h3>Temporary failures: sloppy quorum and hinted handoff</h3>
+  <p>With a <b>strict quorum</b>, reads and writes could be blocked while replicas are down. Instead:</p>
+  <ul>
+    <li><b>Sloppy quorum:</b> don't enforce the quorum requirement. Use the <b>first W healthy servers</b> for writes and the <b>first R healthy servers</b> for reads on the ring, ignoring offline ones.</li>
+    <li><b>Hinted handoff:</b> while a server is unavailable (network or server failure), another server handles its requests. When it comes back, the changes are pushed back to it to restore consistency.</li>
+  </ul>
+  <figure class="fig small">
+    <img src="../assets/img/p-101-080.jpg" alt="Coordinator writes put(key1, val1) to s0 and s1, which ACK; the write to s2 fails with a red X; s3 is the next server on the ring">
+    <figcaption><b>Figure 6-12</b> · s2 is down, so s3 handles its reads and writes, then hands the data back when s2 recovers.</figcaption>
+  </figure>
+  <aside class="callout note">
+    <span class="callout-label">Beyond the book</span>
+    <p>A sloppy quorum weakens the W + R &gt; N guarantee. The W acks may come from stand-ins like s3, outside the key's usual N replicas, so a later read quorum can miss the newest value until hinted handoff finishes. Dynamo accepts this to keep writes available.</p>
+  </aside>
+
+  <h3>Permanent failures: anti-entropy with Merkle trees</h3>
+  <p>If a replica is <b>permanently</b> unavailable, run an <b>anti-entropy protocol</b>: compare each piece of data on the replicas and update each to the newest version. A <b>Merkle tree</b> detects the inconsistencies and minimizes the data transferred.</p>
+  <p>A Merkle (hash) tree labels every non-leaf node with the hash of its children's labels (or values, for leaves). It allows efficient and secure verification of the contents of large data structures.</p>
+  <h4>Building one (key space 1–12; red = inconsistent)</h4>
+  <ol class="flow">
+    <li><b>Divide the key space into buckets</b> (4 here). A bucket is the root-level node, which keeps the tree's depth limited.
+      <figure class="fig medium">
+        <img src="../assets/img/p-102-081.jpg" alt="Server 1 and server 2 each hold keys 1 to 12 in four buckets; key 8 exists on server 1 but is missing on server 2">
+        <figcaption><b>Figure 6-13</b> · Key 8 is on server 1 but missing on server 2.</figcaption>
+      </figure>
+    </li>
+    <li><b>Hash each key</b> in a bucket using a uniform hashing method.
+      <figure class="fig">
+        <img src="../assets/img/p-102-082.jpg" alt="Each key mapped to a hash value, such as 1 to 2343 and 8 to 1356; server 2 lacks key 8">
+        <figcaption><b>Figure 6-14</b> · <code>8 → 1356</code> exists on server 1 only.</figcaption>
+      </figure>
+    </li>
+    <li><b>Create one hash node per bucket.</b>
+      <figure class="fig">
+        <img src="../assets/img/p-102-083.jpg" alt="Bucket hashes 6901, 6773, 8601, 7812 on server 1 and 6901, 6773, 7975, 7812 on server 2; the third differs">
+        <figcaption><b>Figure 6-15</b> · Only the third bucket hash differs: 8601 vs 7975.</figcaption>
+      </figure>
+    </li>
+    <li><b>Build the tree upwards</b> to the root by hashing children.
+      <figure class="fig">
+        <img src="../assets/img/p-103-084.jpg" alt="Full Merkle trees: server 1 root 5357 with children 3545 and 4603; server 2 root 9213 with children 3545 and 2960">
+        <figcaption><b>Figure 6-16</b> · The roots differ; follow the red path down to the bad bucket.</figcaption>
+      </figure>
+    </li>
+  </ol>
+  <h4>Comparing two trees</h4>
+  <p>Compare the root hashes. If they match, both servers have the same data. If not, compare the left child hashes, then the right, descending to find the buckets that are out of sync. Synchronize <b>only those buckets</b>:</p>
+  <table>
+    <tr><th>Node</th><th>Server 1</th><th>Server 2</th><th>Action</th></tr>
+    <tr><td>Root</td><td>5357</td><td>9213</td><td class="no">✗ Descend</td></tr>
+    <tr><td>Left child (keys 1–6)</td><td>3545</td><td>3545</td><td class="yes">✓ Skip</td></tr>
+    <tr><td>Right child (keys 7–12)</td><td>4603</td><td>2960</td><td class="no">✗ Descend</td></tr>
+    <tr><td>Bucket 3 (keys 7–9)</td><td>8601</td><td>7975</td><td class="no">✗ Sync this bucket</td></tr>
+    <tr><td>Bucket 4 (keys 10–12)</td><td>7812</td><td>7812</td><td class="yes">✓ Skip</td></tr>
+  </table>
+  <p>Data synchronized is proportional to the <b>differences</b> between replicas, not the amount of data they hold. Real buckets are big:</p>
+  <div class="stats">
+    <div class="stat"><b>1 billion</b><span>keys</span></div>
+    <div class="stat"><b>1 million</b><span>buckets (a possible configuration)</span></div>
+    <div class="stat"><b>1,000</b><span>keys per bucket</span></div>
+  </div>
+
+  <h3>Data center outage</h3>
+  <p>A whole data center can go down (power outage, network outage, natural disaster, etc.). <b>Replicate data across multiple data centers</b>, so users can still reach the data through the others when one is completely offline.</p>
+</section>
+
+<section id="architecture">
+  <h2>System architecture diagram</h2>
+  <p class="one-liner">A <b>decentralized ring of identical nodes</b>. Any node can coordinate a request, so there is no single point of failure.</p>
+  <figure class="fig">
+    <img src="../assets/img/p-104-085.jpg" alt="Client sends read/write to coordinator n6 on a ring of nodes n0 to n7; n6 forwards to replicas n0, n1, n2 and returns the response">
+    <figcaption><b>Figure 6-17</b> · Coordinator n6 forwards the request to the key's replicas n0, n1, n2 and returns the response.</figcaption>
+  </figure>
+  <ul>
+    <li>Clients use two simple APIs: <code>get(key)</code> and <code>put(key, value)</code>.</li>
+    <li>A <b>coordinator</b> node acts as a proxy between the client and the store.</li>
+    <li>Nodes sit on a ring using <b>consistent hashing</b>.</li>
+    <li><b>Completely decentralized</b>, so adding and moving nodes can be automatic.</li>
+    <li>Data is <b>replicated</b> at multiple nodes.</li>
+    <li><b>No single point of failure</b>: every node has the same responsibilities.</li>
+  </ul>
+  <p>So each node performs many tasks (Figure 6-18):</p>
+  <ul class="tags">
+    <li>Client API</li>
+    <li>Failure detection</li>
+    <li>Conflict resolution</li>
+    <li>Failure repair mechanism</li>
+    <li>Replication</li>
+    <li>Storage engine</li>
+    <li>…</li>
+  </ul>
+</section>
+
+<section id="write-path">
+  <h2>Write path</h2>
+  <p class="one-liner">A write is <b>logged, buffered in memory, then flushed</b> to sorted files on disk. Both paths are based mainly on Cassandra's architecture.</p>
+  <figure class="fig">
+    <img src="../assets/img/p-105-087.jpg" alt="Write path: client write goes 1 to the commit log on disk and 2 to the memory cache; 3 the memory cache flushes to SSTables on disk">
+    <figcaption><b>Figure 6-19</b> · The commit log and SSTables live on disk; only the memory cache is in RAM.</figcaption>
+  </figure>
+  <ol class="flow">
+    <li>The write request is persisted to a <b>commit log</b> file.</li>
+    <li>The data is saved in the <b>memory cache</b>.</li>
+    <li>When the memory cache is full or reaches a predefined threshold, the data is <b>flushed to an SSTable</b> on disk. An <b>SSTable (sorted-string table)</b> is a sorted list of <code>&lt;key, value&gt;</code> pairs.</li>
+  </ol>
+</section>
+
+<section id="read-path">
+  <h2>Read path</h2>
+  <p class="one-liner">Check memory first. On a miss, a <b>bloom filter</b> tells you which SSTables might hold the key.</p>
+  <p>The node first checks the memory cache. If the data is there, it goes straight back to the client.</p>
+  <figure class="fig">
+    <img src="../assets/img/p-106-088.jpg" alt="Read hit: client read request is answered directly from the memory cache">
+    <figcaption><b>Figure 6-20</b> · Cache hit: the disk is never touched.</figcaption>
+  </figure>
+  <p>Otherwise the data comes from disk, and you need an efficient way to find which SSTable holds the key. A <b>bloom filter</b> is commonly used.</p>
+  <figure class="fig">
+    <img src="../assets/img/p-106-089.jpg" alt="Read miss: 1 memory cache, 2 bloom filter, 3 SSTables, 4 result data, 5 return result to client">
+    <figcaption><b>Figure 6-21</b> · Cache miss: the bloom filter decides which SSTables are worth reading.</figcaption>
+  </figure>
+  <ol class="flow">
+    <li>Check whether the data is in memory. If not, go to step 2.</li>
+    <li>Check the bloom filter.</li>
+    <li>The bloom filter works out which SSTables might contain the key.</li>
+    <li>The SSTables return the result of the data set.</li>
+    <li>The result is returned to the client.</li>
+  </ol>
+  <aside class="callout note">
+    <span class="callout-label">Beyond the book</span>
+    <p>Cassandra calls the memory cache the <b>memtable</b>. The commit log is for durability: after a crash, replaying it restores writes that weren't flushed yet. Each SSTable has its own bloom filter, which answers "definitely not here" or "maybe here". False positives happen but false negatives don't, so a "no" safely skips that SSTable's disk read.</p>
+  </aside>
+</section>
+
+<section id="summary">
+  <h2>Summary: goal → technique</h2>
+  <p class="one-liner">Every requirement maps to one technique. Walk this table to wrap up.</p>
+  <table>
+    <tr><th>Goal / problem</th><th>Technique</th></tr>
+    <tr><td>Ability to store big data</td><td>Use <a href="#partition">consistent hashing</a> to spread the load across servers</td></tr>
+    <tr><td>High availability reads</td><td><a href="#replication">Data replication</a>; multi-data center setup</td></tr>
+    <tr><td>Highly available writes</td><td><a href="#versioning">Versioning and conflict resolution with vector clocks</a></td></tr>
+    <tr><td>Dataset partition</td><td>Consistent hashing</td></tr>
+    <tr><td>Incremental scalability</td><td>Consistent hashing</td></tr>
+    <tr><td>Heterogeneity</td><td>Consistent hashing (virtual nodes)</td></tr>
+    <tr><td>Tunable consistency</td><td><a href="#consistency">Quorum consensus</a></td></tr>
+    <tr><td>Handling temporary failures</td><td><a href="#failures">Sloppy quorum and hinted handoff</a></td></tr>
+    <tr><td>Handling permanent failures</td><td>Merkle tree</td></tr>
+    <tr><td>Handling data center outage</td><td>Cross-data center replication</td></tr>
+  </table>
+</section>
+
+<section id="self-test">
+  <h2>Self-test</h2>
+  <details class="qa"><summary>What are the seven requirements for this key-value store?</summary><div><p>Pairs smaller than 10 KB, ability to store big data, high availability, high scalability, automatic scaling, tunable consistency, and low latency.</p></div></details>
+  <details class="qa"><summary>Define consistency, availability and partition tolerance. Why can't a CA system exist in practice?</summary><div><p>C: all clients see the same data at the same time. A: every request gets a response even if some nodes are down. P: the system keeps working despite communication breaks between nodes. Network failure is unavoidable, so a distributed system must tolerate partitions, which rules out CA.</p></div></details>
+  <details class="qa"><summary>Three replicas; n3 is cut off from n1 and n2. What does a CP system do, and what does an AP system do?</summary><div><p><b>CP:</b> blocks writes to n1 and n2 so nothing diverges, making the system unavailable (a bank returns an error). <b>AP:</b> keeps accepting reads (possibly stale) and writes on n1 and n2, then syncs n3 when the partition heals.</p></div></details>
+  <details class="qa"><summary>Which technique partitions the data, and what two advantages does it bring here?</summary><div><p>Consistent hashing: it spreads keys evenly and minimizes movement when nodes change. It enables <b>automatic scaling</b> and <b>heterogeneity</b> (virtual nodes proportional to server capacity).</p></div></details>
+  <details class="qa"><summary>How are a key's N replicas chosen, and what two refinements improve reliability?</summary><div><p>Walk clockwise from the key's ring position and take the first N servers. Count only <b>unique physical servers</b> (virtual nodes can repeat a server), and place replicas in <b>distinct data centers</b>, since nodes in one data center often fail together.</p></div></details>
+  <details class="qa"><summary>With N = 3, what does W = 1 actually mean?</summary><div><p>The data is still sent to all three replicas. The coordinator just considers the write successful after the first acknowledgment, without waiting for the other two.</p></div></details>
+  <details class="qa"><summary>When is strong consistency guaranteed? Give the fast-read and fast-write configurations.</summary><div><p>When <b>W + R &gt; N</b>, because read and write quorums must overlap in at least one node holding the latest data (typically N = 3, W = R = 2). Fast reads: R = 1, W = N. Fast writes: W = 1, R = N. W + R ≤ N gives no guarantee.</p></div></details>
+  <details class="qa"><summary>Strong vs weak vs eventual consistency: which does this design choose, and why?</summary><div><p>Strong: reads always see the latest write. Weak: reads may miss it. Eventual: replicas converge given enough time. The design uses <b>eventual</b> consistency (like Dynamo and Cassandra), because strong consistency blocks operations until all replicas agree, which hurts availability.</p></div></details>
+  <details class="qa"><summary>In the vector clock example, why is D5 <code>([Sx, 3], [Sy, 1], [Sz, 1])</code>?</summary><div><p>D3 <code>([Sx, 2], [Sy, 1])</code> and D4 <code>([Sx, 2], [Sz, 1])</code> conflict. A client reconciles them, and Sx handles the write, so Sx's counter goes from 2 to 3 while Sy and Sz carry over.</p></div></details>
+  <details class="qa"><summary>How do you tell from two vector clocks whether they conflict?</summary><div><p>X is an ancestor of Y if every counter in Y is ≥ X's. They conflict (siblings) if each has some counter smaller than the other's, e.g. <code>([s0, 1], [s1, 2])</code> vs <code>([s0, 2], [s1, 1])</code>.</p></div></details>
+  <details class="qa"><summary>What are the two downsides of vector clocks, and how is clock growth handled?</summary><div><p>Clients must implement conflict resolution, and the pairs can grow fast. Cap the length and drop the oldest pairs. This can make reconciliation inaccurate, but Amazon hasn't seen the problem in production.</p></div></details>
+  <details class="qa"><summary>Why gossip instead of all-to-all multicast, and how does gossip mark a node down?</summary><div><p>All-to-all is inefficient with many servers. With gossip, each node keeps a membership list of heartbeat counters, increments its own, and sends heartbeats to random nodes. If a member's counter doesn't increase for a set period, it is considered offline, and it's marked down once other nodes confirm.</p></div></details>
+  <details class="qa"><summary>What are sloppy quorum and hinted handoff?</summary><div><p><b>Sloppy quorum:</b> use the first W (or R) <i>healthy</i> servers on the ring and ignore offline ones. <b>Hinted handoff:</b> a stand-in server (s3 for a down s2) handles requests temporarily and pushes the data back when the failed server recovers.</p></div></details>
+  <details class="qa"><summary>How do Merkle trees repair permanent failures efficiently?</summary><div><p>Hash keys, then buckets, then up to a root. Compare roots and descend only into subtrees whose hashes differ, then sync just those buckets. Transfer is proportional to the differences, not the data size (e.g. 1 million buckets for 1 billion keys = 1,000 keys per bucket).</p></div></details>
+  <details class="qa"><summary>Describe the write path and the read path on a node.</summary><div><p><b>Write:</b> append to the commit log, save in the memory cache, flush to an SSTable when the cache hits its threshold. <b>Read:</b> check the memory cache; on a miss, use the bloom filter to find which SSTables might hold the key, read them, return the result.</p></div></details>
+</section>
+
+<section id="glossary">
+  <h2>Terms to know</h2>
+  <dl class="glossary">
+    <dt>CAP theorem</dt><dd>A distributed system can provide at most two of consistency, availability and partition tolerance at the same time.</dd>
+    <dt>Virtual node</dt><dd>One of several ring positions owned by a physical server. More virtual nodes means more data for that server.</dd>
+    <dt>Quorum (N, W, R)</dt><dd>N replicas; a write needs W acknowledgments and a read needs R responses.</dd>
+    <dt>Coordinator</dt><dd>The node that proxies a client request to the key's replicas.</dd>
+    <dt>Eventual consistency</dt><dd>Weak consistency where all replicas converge once updates have propagated.</dd>
+    <dt>Vector clock</dt><dd>A list of <code>[server, version]</code> pairs on a data item, used to detect ancestor vs conflicting versions.</dd>
+    <dt>Gossip protocol</dt><dd>Decentralized failure detection: nodes spread heartbeat counters to random peers.</dd>
+    <dt>Sloppy quorum</dt><dd>Use the first W/R healthy servers on the ring instead of the fixed replicas.</dd>
+    <dt>Hinted handoff</dt><dd>A stand-in server holds a down server's writes and hands them back when it recovers.</dd>
+    <dt>Merkle tree</dt><dd>A tree of hashes. Anti-entropy compares trees to find and sync only the buckets that differ.</dd>
+    <dt>SSTable</dt><dd>Sorted-string table: an on-disk, sorted list of key-value pairs.</dd>
+    <dt>Bloom filter</dt><dd>A compact structure used on reads to find which SSTables might contain a key.</dd>
+  </dl>
+  <details class="more refs"><summary>Book references (go deeper)</summary><div><ol>
+    <li><a href="https://aws.amazon.com/dynamodb/">Amazon DynamoDB</a></li>
+    <li><a href="https://memcached.org/">memcached</a></li>
+    <li><a href="https://redis.io/">Redis</a></li>
+    <li><a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo: Amazon's Highly Available Key-value Store</a></li>
+    <li><a href="https://cassandra.apache.org/">Cassandra</a></li>
+    <li><a href="https://static.googleusercontent.com/media/research.google.com/en//archive/bigtable-osdi06.pdf">Bigtable: A Distributed Storage System for Structured Data</a></li>
+    <li><a href="https://en.wikipedia.org/wiki/Merkle_tree">Merkle tree</a></li>
+    <li><a href="https://cassandra.apache.org/doc/latest/architecture/">Cassandra architecture</a></li>
+    <li><a href="https://www.igvita.com/2012/02/06/sstable-and-log-structured-storage-leveldb/">SSTable and Log Structured Storage: LevelDB</a></li>
+    <li><a href="https://en.wikipedia.org/wiki/Bloom_filter">Bloom filter</a></li>
+  </ol></div></details>
+</section>
+
+</main>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var n = $("q-n"), w = $("q-w"), r = $("q-r");
+  function plural(k, word) { return k + " " + word + (k === 1 ? "" : "s"); }
+  function render() {
+    var N = +n.value;
+    w.max = N; r.max = N;
+    var W = Math.min(+w.value, N), R = Math.min(+r.value, N);
+    w.value = W; r.value = R;
+    $("q-nv").textContent = N; $("q-wv").textContent = W; $("q-rv").textContent = R;
+    var boxes = [];
+    for (var i = 0; i < N; i++) {
+      var inW = i < W, inR = i >= N - R;
+      var c = inW && inR ? "note" : inW ? "key" : inR ? "tip" : "";
+      var bd = c ? "var(--" + c + ")" : "var(--line)", bg = c ? "var(--" + c + "-tint)" : "var(--surface-2)";
+      boxes.push('<div style="min-width:62px;padding:6px 8px;border:2px solid ' + bd + ";background:" + bg +
+        ';border-radius:8px;text-align:center;font:13px/1.5 var(--mono)"><b>s' + i + "</b><br>" +
+        (inW ? "W" : "·") + " " + (inR ? "R" : "·") + "</div>");
+    }
+    $("q-boxes").innerHTML = boxes.join("");
+    var overlap = Math.max(0, W + R - N), strong = W + R > N, lines = [];
+    lines.push("W + R = " + (W + R) + (strong ? " &gt; " : " ≤ ") + "N = " + N + " → " + (strong
+      ? '<b style="color:var(--yes)">strong consistency guaranteed</b>: any read quorum overlaps any write quorum in at least ' + plural(overlap, "replica") + "."
+      : '<b style="color:var(--no)">strong consistency not guaranteed</b>: a read can miss every replica that has the latest write.'));
+    if (N > 1 && R === 1 && W === N) lines.push("Profile: optimized for <b>fast reads</b> (R = 1, W = N).");
+    else if (N > 1 && W === 1 && R === N) lines.push("Profile: optimized for <b>fast writes</b> (W = 1, R = N).");
+    lines.push("A write waits for " + plural(W, "ack") + "; a read waits for " + plural(R, "response") + " (data still goes to " + (N === 1 ? "the only replica" : "all " + N + " replicas") + ").");
+    $("q-out").innerHTML = lines.join("<br>");
+  }
+  [n, w, r].forEach(function (el) { el.addEventListener("input", render); });
+  Array.prototype.forEach.call(document.querySelectorAll("#quorum-demo [data-q]"), function (b) {
+    b.onclick = function () {
+      var v = b.getAttribute("data-q").split(",");
+      n.value = v[0]; w.max = v[0]; r.max = v[0]; w.value = v[1]; r.value = v[2]; render();
+    };
+  });
+  render();
+})();
+</script>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

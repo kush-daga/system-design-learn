@@ -1,0 +1,569 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 4 · Design a Rate Limiter — SDI Fast Track</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem("sdi:theme");if(t)document.documentElement.dataset.theme=JSON.parse(t)}catch(e){}</script>
+</head>
+<body data-root=".." data-chapter="4">
+<main id="content" class="chapter">
+
+<header class="chapter-hero">
+  <p class="eyebrow">Chapter 4 · Design problem</p>
+  <h1>Design a Rate Limiter</h1>
+  <p class="lede">How to cap the requests a client can send: where the limiter sits, the five classic algorithms with their worked numbers, and how Redis keeps the counts correct across many servers.</p>
+  <div class="meta-row"></div>
+  <ul class="pace">
+    <li><a href="#tldr">⚡ TL;DR <small>2 min</small></a></li>
+    <li><a href="#skeleton">🗣 Interview answer <small>3 min</small></a></li>
+    <li><a href="#step-1">📖 Full walkthrough</a></li>
+    <li><a href="#self-test">🧠 Self-test</a></li>
+  </ul>
+</header>
+
+<section id="tldr" class="tldr">
+  <h2>TL;DR</h2>
+  <ul>
+    <li><b>What:</b> cap the requests a client (user, IP, device…) sends per time period; reject the excess with <b>HTTP 429 Too Many Requests</b>. Prevents DoS, cuts cost, stops overload.</li>
+    <li><b>Scope:</b> server-side, distributed, flexible rules, low latency, little memory, fault tolerant, and it tells throttled users.</li>
+    <li><b>Where:</b> not the client (requests can be forged). Put it in the API servers or in <b>middleware / an API gateway</b>.</li>
+    <li><b>Five algorithms:</b> token bucket (allows bursts; Amazon, Stripe), leaking bucket (FIFO queue, fixed outflow; Shopify), fixed window counter (up to 2× at window edges), sliding window log (exact, memory-hungry), sliding window counter (current + previous × overlap; cheap approximation).</li>
+    <li><b>Counters live in Redis</b> (in-memory, with expiry): <code>INCR</code> + <code>EXPIRE</code>. Rules live in config files, cached by workers.</li>
+    <li><b>Headers:</b> <code>X-Ratelimit-Remaining</code>, <code>-Limit</code>, <code>-Retry-After</code>. Throttled requests are dropped or queued.</li>
+    <li><b>Distributed:</b> race conditions → Lua script or Redis sorted sets (not locks). Many limiters → one central Redis (not sticky sessions).</li>
+    <li><b>Extras:</b> edge data centers, eventual consistency, monitoring, hard vs soft limits, layer-3 limiting (iptables), client best practices.</li>
+  </ul>
+  <figure class="fig">
+    <img src="../assets/img/p-065-046.jpg" alt="Detailed design: client to rate limiter middleware, which reads cached rules (loaded by workers from disk) and counters in Redis, forwards successes to API servers, and on rate limit returns 429 and either drops the request or sends it to a message queue">
+    <figcaption><b>Figure 4-13</b> · The final design. Middleware checks cached rules and Redis counters; success goes to the API servers, the rest get a 429 and are dropped or queued.</figcaption>
+  </figure>
+</section>
+
+<section id="skeleton">
+  <h2>Interview answer skeleton</h2>
+  <p class="one-liner">If asked this in an interview, walk through these four beats. Each maps to a section below.</p>
+  <ol class="framework">
+    <li><b>Clarify (≈5 min)</b> Client- or server-side? Throttle by IP, user ID or something else? Scale? Distributed? Separate service or in app code? Tell throttled users? Then state the requirements: accurate, low latency, low memory, distributed, clear exceptions, fault tolerant.</li>
+    <li><b>High-level (≈15 min)</b> Rule out the client and place the limiter in middleware. Give one line on each of the five algorithms and pick one (token bucket is widely used and allows bursts). Draw client → middleware → API servers, with counters in Redis via <code>INCR</code>/<code>EXPIRE</code>.</li>
+    <li><b>Deep dive (≈15 min)</b> Rules in config files cached by workers; 429 plus <code>X-Ratelimit-*</code> headers; drop or queue throttled requests; race conditions (Lua script, sorted sets); synchronization (central Redis); multi-DC edges with eventual consistency; monitoring.</li>
+    <li><b>Wrap up (≈5 min)</b> Hard vs soft limits, limiting at layer 3 (iptables) vs layer 7, and client best practices (cache, catch errors, back off).</li>
+  </ol>
+</section>
+
+<section id="step-1">
+  <h2><span class="step-num">Step 1</span>Understand the problem and establish design scope</h2>
+  <p class="one-liner">A <b>rate limiter</b> controls the rate of traffic a client or service sends. Pin down which kind you're building before picking an algorithm.</p>
+  <p>In HTTP terms, it limits how many requests a client may send over a set period. Once the count passes the threshold, every excess call is blocked. For example:</p>
+  <ul>
+    <li>A user can write no more than 2 posts per second.</li>
+    <li>At most 10 accounts can be created per day from the same IP address.</li>
+    <li>Rewards can be claimed no more than 5 times per week from the same device.</li>
+  </ul>
+
+  <h3>Why rate limit?</h3>
+  <table>
+    <tr><th>Benefit</th><th>Details</th></tr>
+    <tr><td><b>Prevent resource starvation from DoS</b></td><td>A <b>Denial of Service (DoS)</b> attack floods a service so real users can't get through. Blocking excess calls stops both intentional and unintentional DoS. Almost all big-company APIs enforce limits: Twitter allows <b>300 tweets per 3 hours</b>; Google Docs APIs default to <b>300 read requests per user per 60 seconds</b>.</td></tr>
+    <tr><td><b>Reduce cost</b></td><td>Fewer excess requests means fewer servers and more resources for high-priority APIs. Essential when you pay per call for third-party APIs such as checking credit, making a payment or retrieving health records.</td></tr>
+    <tr><td><b>Prevent server overload</b></td><td>Filters out excess requests caused by bots or misbehaving users.</td></tr>
+  </table>
+
+  <h3>Clarifying questions</h3>
+  <table class="qa-table">
+    <tr><th>You ask</th><th>Interviewer says</th></tr>
+    <tr><td>Client-side rate limiter or server-side API rate limiter?</td><td>Server-side API rate limiter.</td></tr>
+    <tr><td>Throttle by IP, user ID or other properties?</td><td>Flexible enough to support different sets of throttle rules.</td></tr>
+    <tr><td>Scale: a startup or a big company with many users?</td><td>Must handle a large number of requests.</td></tr>
+    <tr><td>Will it run in a distributed environment?</td><td>Yes.</td></tr>
+    <tr><td>Separate service, or implemented in application code?</td><td>Your design decision.</td></tr>
+    <tr><td>Do we inform users who are throttled?</td><td>Yes.</td></tr>
+  </table>
+
+  <h4>Requirements</h4>
+  <ul class="checklist">
+    <li><b>Accurately</b> limit excessive requests</li>
+    <li><b>Low latency:</b> must not slow down HTTP response time</li>
+    <li>Use <b>as little memory</b> as possible</li>
+    <li><b>Distributed:</b> one limiter shared across multiple servers or processes</li>
+    <li><b>Exception handling:</b> show clear exceptions to users when they're throttled</li>
+    <li><b>High fault tolerance:</b> a limiter problem (e.g. a cache server going offline) doesn't take down the whole system</li>
+  </ul>
+</section>
+
+<section id="step-2">
+  <h2><span class="step-num">Step 2</span>Propose high-level design and get buy-in</h2>
+  <p class="one-liner">Decide <b>where</b> the limiter sits, <b>which algorithm</b> it runs, and <b>where the counters live</b> (Redis).</p>
+
+  <h3>Where to put the rate limiter</h3>
+  <table>
+    <tr><th>Placement</th><th>How it works</th><th>Verdict</th></tr>
+    <tr><td><b>Client-side</b></td><td>The app limits itself before sending</td><td class="no">✗ Unreliable: malicious actors can forge requests, and you may not control the client code.</td></tr>
+    <tr><td><b>Server-side</b></td><td>The limiter runs inside the API servers (Figure 4-1)</td><td class="yes">✓ Full control over the algorithm.</td></tr>
+    <tr><td><b>Middleware</b></td><td>A separate layer in front of the API servers throttles requests before they reach them (Figure 4-2)</td><td class="yes">✓ In cloud microservices this is usually the <b>API gateway</b>.</td></tr>
+  </table>
+  <div class="fig-row">
+    <figure class="fig">
+      <img src="../assets/img/p-053-034.jpg" alt="Client sends HTTP request to API servers that contain the rate limiter">
+      <figcaption><b>Figure 4-1</b> · Server-side: the limiter lives inside the API servers.</figcaption>
+    </figure>
+    <figure class="fig">
+      <img src="../assets/img/p-053-035.jpg" alt="Rate limiter middleware placed between the client and the API servers">
+      <figcaption><b>Figure 4-2</b> · Middleware: the limiter sits between client and API servers.</figcaption>
+    </figure>
+  </div>
+  <p>Example (Figure 4-3): the API allows <b>2 requests per second</b> and a client sends 3 within one second. The first two reach the API servers. The middleware throttles the third and returns <b>HTTP 429</b>, meaning the user has sent too many requests.</p>
+  <figure class="fig medium">
+    <img src="../assets/img/p-054-036.jpg" alt="Three requests from client; two pass the rate limiter to API servers, the third gets 429 Too many requests">
+    <figcaption><b>Figure 4-3</b> · Follow the red dashed arrow: request 3 is answered by the middleware, never reaching the API servers.</figcaption>
+  </figure>
+  <p>An <b>API gateway</b> is a fully managed service that supports rate limiting, SSL termination, authentication, IP whitelisting, serving static content and more. For now, treat it as middleware that supports rate limiting.</p>
+
+  <h4>Server-side or gateway? Guidelines</h4>
+  <p>There's no absolute answer. It depends on your company's tech stack, engineering resources, priorities and goals.</p>
+  <ul>
+    <li><b>Check your tech stack</b> (language, cache service…). Make sure your language is efficient enough to implement rate limiting on the server side.</li>
+    <li><b>Pick the algorithm that fits the business.</b> Server-side gives you full control of the algorithm; a third-party gateway may limit your choice.</li>
+    <li><b>Already using microservices with an API gateway</b> for authentication, IP whitelisting, etc.? Add the rate limiter to the gateway.</li>
+    <li><b>Building your own takes time.</b> Without enough engineering resources, a commercial API gateway is the better option.</li>
+  </ul>
+
+  <h3>Algorithms for rate limiting</h3>
+  <p>Knowing the algorithms at a high level lets you pick the right one, or a combination, for the use case. The five popular ones: <b>token bucket</b>, <b>leaking bucket</b>, <b>fixed window counter</b>, <b>sliding window log</b> and <b>sliding window counter</b>. A comparison table follows them.</p>
+
+  <h3>Algorithm 1 · Token bucket</h3>
+  <p>Widely used, simple and well understood. <b>Amazon</b> and <b>Stripe</b> use it to throttle their APIs.</p>
+  <ol class="flow">
+    <li>The bucket has a <b>pre-defined capacity</b>. A <b>refiller</b> adds tokens at a preset rate. Once the bucket is full, extra tokens overflow and are lost. In Figure 4-4 the capacity is <b>4</b> and the refiller adds <b>2 tokens per second</b>.</li>
+    <li>Each request <b>consumes one token</b>. When a request arrives, check whether the bucket has enough tokens.</li>
+    <li>Enough tokens → take one out and let the request through. Not enough → <b>drop</b> the request (Figure 4-5).</li>
+  </ol>
+  <div class="fig-row">
+    <figure class="fig">
+      <img src="../assets/img/p-055-037.jpg" alt="A refiller drops tokens into a bucket holding 4 tokens; an extra token overflows">
+      <figcaption><b>Figure 4-4</b> · Capacity 4. Tokens beyond capacity overflow.</figcaption>
+    </figure>
+    <figure class="fig">
+      <img src="../assets/img/p-056-038.jpg" alt="Requests hit the bucket; if enough tokens, forward with a token each; otherwise drop">
+      <figcaption><b>Figure 4-5</b> · Each forwarded request carries a token; no token means dropped.</figcaption>
+    </figure>
+  </div>
+  <figure class="fig medium">
+    <img src="../assets/img/p-057-039.jpg" alt="Four panels: 1:00:00 four tokens, one request passes; 1:00:05 three tokens, three requests pass; 1:00:20 zero tokens, request dropped; 1:01:00 four tokens refilled">
+    <figcaption><b>Figure 4-6</b> · Size 4, refill 4 per minute. 1:00:00: 4 tokens, 1 request passes. 1:00:05: 3 requests use the last 3 tokens. 1:00:20: bucket empty, request dropped. 1:01:00: refilled to 4.</figcaption>
+  </figure>
+  <h4>Parameters</h4>
+  <ul>
+    <li><b>Bucket size:</b> the maximum number of tokens allowed in the bucket.</li>
+    <li><b>Refill rate:</b> the number of tokens put into the bucket every second (Figure 4-6 uses a per-minute rate).</li>
+  </ul>
+  <h4>How many buckets?</h4>
+  <p>It depends on the rate-limiting rules:</p>
+  <ul>
+    <li><b>One per API endpoint, per user.</b> If a user may make 1 post per second, add 150 friends per day and like 5 posts per second, each user needs <b>3 buckets</b>.</li>
+    <li><b>One per IP address</b> if you throttle by IP.</li>
+    <li><b>One global bucket</b> shared by all requests if the system allows a maximum of, say, 10,000 requests per second.</li>
+  </ul>
+  <div class="pros-cons">
+    <div class="pros"><h4>Pros</h4><ul><li>Easy to implement</li><li>Memory efficient</li><li>Allows short bursts of traffic: a request goes through as long as tokens are left</li></ul></div>
+    <div class="cons"><h4>Cons</h4><ul><li>Two parameters (bucket size, refill rate) that can be hard to tune properly</li></ul></div>
+  </div>
+  <aside class="callout note">
+    <span class="callout-label">Beyond the book</span>
+    <p>Implementations usually don't run a timer per bucket. They store the token count and the <b>last refill timestamp</b>, and on each request compute <code>tokens = min(size, tokens + elapsed × rate)</code>. Stripe's Lua script (reference [13]) does exactly this, matching the detailed design's "counters and last request timestamp" in Redis. The demo below refills this way, so tokens trickle back instead of arriving all at once as in Figure 4-6.</p>
+  </aside>
+
+  <h3>Algorithm 2 · Leaking bucket</h3>
+  <p>Like the token bucket, except requests are <b>processed at a fixed rate</b>. It's usually built on a <b>first-in-first-out (FIFO) queue</b>. <b>Shopify</b> uses leaky buckets.</p>
+  <ol class="flow">
+    <li>A request arrives. Is the queue full?</li>
+    <li>Not full → add the request to the queue. Full → drop it.</li>
+    <li>Requests are pulled from the queue and processed at regular intervals.</li>
+  </ol>
+  <figure class="fig">
+    <img src="../assets/img/p-058-040.jpg" alt="Requests check bucket full; if no, enter a queue processed at a fixed rate; if yes, dropped">
+    <figcaption><b>Figure 4-7</b> · The queue is the bucket. It drains at a fixed rate no matter how fast requests arrive.</figcaption>
+  </figure>
+  <h4>Parameters</h4>
+  <ul>
+    <li><b>Bucket size:</b> equal to the queue size. The queue holds requests waiting to be processed at the fixed rate.</li>
+    <li><b>Outflow rate:</b> how many requests are processed per fixed interval, usually per second.</li>
+  </ul>
+  <div class="pros-cons">
+    <div class="pros"><h4>Pros</h4><ul><li>Memory efficient, given the limited queue size</li><li>Fixed processing rate suits use cases that need a stable outflow</li></ul></div>
+    <div class="cons"><h4>Cons</h4><ul><li>A burst fills the queue with old requests; if they aren't processed in time, recent requests get rate limited</li><li>Two parameters that may not be easy to tune</li></ul></div>
+  </div>
+
+  <h3>Algorithm 3 · Fixed window counter</h3>
+  <ol class="flow">
+    <li>Divide the timeline into <b>fixed-size time windows</b>, with a counter for each window.</li>
+    <li>Each request increments the counter by one.</li>
+    <li>Once the counter reaches the threshold, drop new requests until the next window starts.</li>
+  </ol>
+  <figure class="fig medium">
+    <img src="../assets/img/p-059-041.jpg" alt="Bar chart per second from 1:00:00 to 1:00:04: up to 3 green successful requests per second, extras grey rate limited">
+    <figcaption><b>Figure 4-8</b> · Window 1 s, limit 3. At 1:00:01, 6 requests arrive and the last 3 are dropped (grey).</figcaption>
+  </figure>
+  <p><b>The big problem:</b> a burst at the edges of two windows lets more than the quota through. In Figure 4-9 the limit is <b>5 requests per minute</b> and the quota resets on the round minute. Five requests land between 2:00:30 and 2:01:00 and five more between 2:01:00 and 2:01:30. Each fixed window sees only 5, but the one-minute window from <b>2:00:30 to 2:01:30</b> lets <b>10</b> through: twice the limit.</p>
+  <figure class="fig medium">
+    <img src="../assets/img/p-059-042.jpg" alt="Timeline 2:00:00 to 2:02:00 with 5 requests just before and 5 just after 2:01:00, boxed as 10 requests in one minute">
+    <figcaption><b>Figure 4-9</b> · Both windows obey the limit, yet the dashed one-minute span holds 10 requests.</figcaption>
+  </figure>
+  <div class="pros-cons">
+    <div class="pros"><h4>Pros</h4><ul><li>Memory efficient</li><li>Easy to understand</li><li>Resetting quota at the end of a unit time window fits certain use cases</li></ul></div>
+    <div class="cons"><h4>Cons</h4><ul><li>A traffic spike at window edges can let more requests than the quota through (up to 2×)</li></ul></div>
+  </div>
+
+  <h3>Algorithm 4 · Sliding window log</h3>
+  <p>Fixes the fixed window's edge problem by remembering <b>when</b> each request happened.</p>
+  <ol class="flow">
+    <li>Keep a log of request timestamps, usually in a cache such as <b>Redis sorted sets</b>.</li>
+    <li>When a request arrives, remove all outdated timestamps: those older than the start of the current window.</li>
+    <li>Add the new request's timestamp to the log.</li>
+    <li>If the log size is <b>≤ the allowed count</b>, accept the request. Otherwise reject it.</li>
+  </ol>
+  <p>Example (Figure 4-10): limit <b>2 requests per minute</b>. Real logs store Linux timestamps; human-readable times are used here.</p>
+  <table>
+    <tr><th>Request at</th><th>Log after the request</th><th>Size</th><th>Result</th></tr>
+    <tr><td>1:00:01</td><td>1:00:01 (log was empty)</td><td>1</td><td class="yes">✓ Allowed</td></tr>
+    <tr><td>1:00:30</td><td>1:00:01, 1:00:30</td><td>2</td><td class="yes">✓ Allowed (not larger than 2)</td></tr>
+    <tr><td>1:00:50</td><td>1:00:01, 1:00:30, 1:00:50</td><td>3</td><td class="no">✗ Rejected, but its timestamp <b>stays in the log</b></td></tr>
+    <tr><td>1:01:40</td><td>Window is [1:00:40, 1:01:40), so 1:00:01 and 1:00:30 are removed → 1:00:50, 1:01:40</td><td>2</td><td class="yes">✓ Allowed</td></tr>
+  </table>
+  <figure class="fig medium">
+    <img src="../assets/img/p-060-043.jpg" alt="Four panels of a log allowing 2 requests per minute: 1:00:01 allowed, 1:00:30 allowed, 1:00:50 rejected, 1:01:40 allowed after striking out 1:00:01 and 1:00:30">
+    <figcaption><b>Figure 4-10</b> · Note panel 3: the rejected 1:00:50 is still logged, and panel 4 strikes out the two expired entries.</figcaption>
+  </figure>
+  <div class="pros-cons">
+    <div class="pros"><h4>Pros</h4><ul><li>Very accurate: in <b>any</b> rolling window, requests never exceed the limit</li></ul></div>
+    <div class="cons"><h4>Cons</h4><ul><li>Uses a lot of memory: even a rejected request's timestamp may be kept</li></ul></div>
+  </div>
+
+  <h3>Algorithm 5 · Sliding window counter</h3>
+  <p>A <b>hybrid</b> of the fixed window counter and the sliding window log. There are two ways to implement it; the book covers one (see reference [9] for the other). It keeps just two counters but estimates a rolling window:</p>
+  <pre><code>requests in rolling window = requests in current window
+                           + requests in previous window × overlap of rolling window with previous window</code></pre>
+  <p>Example: the limit is <b>7 requests per minute</b>. The previous minute had <b>5</b> requests and the current minute has <b>3</b>. A new request arrives <b>30%</b> into the current minute, so the rolling minute overlaps the previous minute by <b>70%</b>:</p>
+  <pre><code>3 + 5 × 0.7 = 6.5  →  rounded down to 6  (6 &lt; 7, so the request goes through)</code></pre>
+  <p>Depending on the use case you can round up or down; the book rounds down. One more request would reach the limit. (The book prints "5 * 0.7%"; the factor is 0.7, i.e. 70%.)</p>
+  <figure class="fig medium">
+    <img src="../assets/img/p-061-044.jpg" alt="Previous minute with 5 requests and current minute with 3; the rolling minute covers 70 percent of the previous and 30 percent of the current">
+    <figcaption><b>Figure 4-11</b> · The rolling minute spans 70% of the previous window and 30% of the current one. (The figure's label says 5 requests/min; the text's worked example uses 7, which is what makes the request pass.)</figcaption>
+  </figure>
+  <div class="pros-cons">
+    <div class="pros"><h4>Pros</h4><ul><li>Smooths out traffic spikes, because the rate is based on the previous window's average rate</li><li>Memory efficient</li></ul></div>
+    <div class="cons"><h4>Cons</h4><ul><li>Only works for a not-so-strict look-back window. It's an approximation that assumes the previous window's requests were evenly spread. In practice that's minor: in Cloudflare's experiments only <b>0.003%</b> of <b>400 million</b> requests were wrongly allowed or rate limited.</li></ul></div>
+  </div>
+
+  <h3>Comparing the five algorithms</h3>
+  <table>
+    <tr><th>Algorithm</th><th>How it decides</th><th>Parameters</th><th>Memory-efficient</th><th>Best at</th><th>Weakness</th></tr>
+    <tr><td><b>Token bucket</b></td><td>Each request takes a token; tokens refill at a fixed rate</td><td>Bucket size, refill rate</td><td class="yes">✓</td><td>Short bursts; simple (Amazon, Stripe)</td><td>Two parameters, hard to tune</td></tr>
+    <tr><td><b>Leaking bucket</b></td><td>FIFO queue drained at a fixed rate; full queue → drop</td><td>Bucket (queue) size, outflow rate</td><td class="yes">✓</td><td>Stable outflow rate (Shopify)</td><td>Bursts fill the queue with old requests, starving new ones; hard to tune</td></tr>
+    <tr><td><b>Fixed window counter</b></td><td>One counter per fixed window</td><td>Window size, limit</td><td class="yes">✓</td><td>Easy to understand; quota resets on round time units</td><td>Up to 2× the limit at window edges</td></tr>
+    <tr><td><b>Sliding window log</b></td><td>Stores every timestamp; counts those inside the rolling window</td><td>Window size, limit</td><td class="no">✗</td><td>Exact in any rolling window</td><td>Memory-hungry; even rejected requests are logged</td></tr>
+    <tr><td><b>Sliding window counter</b></td><td>Current count + previous count × overlap</td><td>Window size, limit</td><td class="yes">✓</td><td>Smooths spikes; near-exact (0.003% wrong)</td><td>Approximation; assumes an even spread in the previous window</td></tr>
+  </table>
+  <aside class="callout tip">
+    <span class="callout-label">Say this in the interview</span>
+    <p>"I'd start with a <b>token bucket</b>: it's easy to implement, memory efficient, allows short bursts, and Amazon and Stripe use it. If edge accuracy matters, a <b>sliding window counter</b> fixes the fixed window's 2× problem without storing every timestamp."</p>
+  </aside>
+
+  <div class="demo" id="rl-demo">
+    <span class="demo-title">Try it · Token bucket vs fixed window counter</span>
+    <p style="font-size:15px;margin-bottom:10px">Both limiters allow <b>4 requests per 4 seconds</b>. Fire single requests or bursts and watch which get <code>200</code> and which get <code>429</code>. The token bucket refills one token per second; the fixed window resets all at once. In fixed-window mode, send a burst just before the window resets and another just after: 8 requests pass within a second.</p>
+    <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:12px">
+      <select id="rl-mode" aria-label="Algorithm"><option value="token">Token bucket (size 4, +1 token/s)</option><option value="fixed">Fixed window (4 per 4 s window)</option></select>
+      <button class="btn primary" id="rl-one" type="button">Send 1 request</button>
+      <button class="btn" id="rl-burst" type="button">Burst of 5</button>
+      <button class="btn" id="rl-reset" type="button">Reset</button>
+    </div>
+    <div id="rl-slots" style="display:flex;gap:8px;margin-bottom:8px" aria-hidden="true"></div>
+    <div class="out" id="rl-state"></div>
+    <div id="rl-line" style="position:relative;height:34px;margin:12px 0 4px;border:1px solid var(--line);border-radius:8px;background:var(--bg);overflow:hidden" aria-hidden="true"></div>
+    <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--ink-3)"><span>16 s ago</span><span>green = accepted · red = 429 · dashed = window boundary</span><span>now</span></div>
+    <div class="out" id="rl-last" style="margin-top:8px" aria-live="polite"></div>
+  </div>
+
+  <h3>High-level architecture</h3>
+  <p>Every algorithm boils down to a <b>counter</b> that tracks how many requests came from the same user, IP address, etc. If the counter is larger than the limit, the request is disallowed.</p>
+  <p><b>Where to store counters?</b> Not a database: disk access is too slow. Use an <b>in-memory cache</b>, which is fast and supports time-based expiration. <b>Redis</b> is a popular choice and offers two commands:</p>
+  <ul>
+    <li><code>INCR</code>: increases the stored counter by 1.</li>
+    <li><code>EXPIRE</code>: sets a timeout on the counter. When it expires, the counter is deleted automatically.</li>
+  </ul>
+  <figure class="fig medium">
+    <img src="../assets/img/p-062-045.jpg" alt="Client to rate limiter middleware, which talks to Redis and forwards to API servers">
+    <figcaption><b>Figure 4-12</b> · Middleware checks the counter in Redis before forwarding to the API servers.</figcaption>
+  </figure>
+  <ol class="flow">
+    <li>The client sends a request to the rate limiting middleware.</li>
+    <li>The middleware fetches the counter from the corresponding bucket in Redis and checks whether the limit is reached.</li>
+    <li>Limit reached → reject the request.</li>
+    <li>Not reached → send the request to the API servers. Meanwhile, increment the counter and save it back to Redis.</li>
+  </ol>
+  <aside class="callout key">
+    <span class="callout-label">Key idea</span>
+    <p>A rate limiter is a <b>per-key counter in a fast in-memory store with an expiry</b>. The algorithm decides how that counter is kept; the deep dive is about keeping it correct and fast across many servers.</p>
+  </aside>
+</section>
+
+<section id="step-3">
+  <h2><span class="step-num">Step 3</span>Design deep dive</h2>
+  <p class="one-liner">Answer what the high-level design leaves open: <b>how rules are created and stored</b>, <b>how throttled requests are handled</b>, and how it all works <b>across many servers</b>.</p>
+
+  <h3>Rate limiting rules</h3>
+  <p><b>Lyft</b> open-sourced its rate-limiting component. Its rules look like this. Allow at most <b>5 marketing messages per day</b>:</p>
+  <pre><code>domain: messaging
+descriptors:
+  - key: message_type
+    value: marketing
+    rate_limit:
+      unit: day
+      requests_per_unit: 5</code></pre>
+  <p>Clients may not log in more than <b>5 times per minute</b>:</p>
+  <pre><code>domain: auth
+descriptors:
+  - key: auth_type
+    value: login
+    rate_limit:
+      unit: minute
+      requests_per_unit: 5</code></pre>
+  <p>Rules are generally written in <b>configuration files and saved on disk</b>. (The book prints the key as <code>Value</code>; Lyft's config uses lowercase <code>value</code>.)</p>
+
+  <h3>Exceeding the rate limit</h3>
+  <p>A rate-limited request gets <b>HTTP 429 (Too Many Requests)</b>. Depending on the use case, you may <b>enqueue</b> rate-limited requests to process later. For example, if some orders are rate limited because the system is overloaded, keep them and process them later.</p>
+  <h4>Rate limiter headers</h4>
+  <p>The client learns whether it's being throttled, and how many requests it has left, from HTTP response headers:</p>
+  <table>
+    <tr><th>Header</th><th>Meaning</th></tr>
+    <tr><td><code>X-Ratelimit-Remaining</code></td><td>Remaining allowed requests within the window</td></tr>
+    <tr><td><code>X-Ratelimit-Limit</code></td><td>How many calls the client can make per time window</td></tr>
+    <tr><td><code>X-Ratelimit-Retry-After</code></td><td>Seconds to wait before you can make a request again without being throttled</td></tr>
+  </table>
+  <p>When a user has sent too many requests, the response is a <b>429</b> with the <code>X-Ratelimit-Retry-After</code> header.</p>
+
+  <h3>Detailed design</h3>
+  <figure class="fig">
+    <img src="../assets/img/p-065-046.jpg" alt="Detailed design with workers loading rules into a cache, rate limiter middleware reading cached rules and Redis counters, API servers on success, and 429 with drop or message queue on rate limit">
+    <figcaption><b>Figure 4-13</b> · Follow the red path: rate-limited requests get a 429, then are dropped (option 1) or sent to a message queue (option 2).</figcaption>
+  </figure>
+  <ol class="flow">
+    <li>Rules are stored on disk. <b>Workers</b> frequently pull them from disk and store them in a <b>cache</b>.</li>
+    <li>A client request goes to the <b>rate limiter middleware</b> first.</li>
+    <li>The middleware loads rules from the cache, and fetches the <b>counters and last request timestamp</b> from Redis.</li>
+    <li>Not rate limited → forward the request to the API servers.</li>
+    <li>Rate limited → return <b>429</b> to the client, and either <b>drop</b> the request or <b>forward it to a message queue</b>.</li>
+  </ol>
+
+  <h3>Rate limiter in a distributed environment</h3>
+  <p>One server is easy. Supporting multiple servers and concurrent threads raises two challenges: <b>race conditions</b> and <b>synchronization</b>.</p>
+  <h4>Race condition</h4>
+  <p>The limiter's basic loop is: read the counter from Redis → check whether <code>counter + 1</code> exceeds the threshold → if not, increment the counter in Redis. Under high concurrency that loop races (Figure 4-14).</p>
+  <figure class="fig medium">
+    <img src="../assets/img/p-066-047.jpg" alt="Two requests both read counter 3, both check and increment to 4, but the counter should be 5">
+    <figcaption><b>Figure 4-14</b> · Both requests read 3 before either writes, so both write 4. The correct value is 5.</figcaption>
+  </figure>
+  <p><b>Locks</b> are the obvious fix but significantly slow the system down. Two strategies are commonly used instead: a <b>Lua script</b> and the Redis <b>sorted set</b> data structure.</p>
+  <aside class="callout note">
+    <span class="callout-label">Beyond the book</span>
+    <p><b>Why these work:</b> Redis runs a Lua script <b>atomically</b> (no other command executes in the middle), so read → check → increment becomes one indivisible step with no locks. The sorted-set approach from reference [8] stores each request's timestamp scored by time and runs <code>ZREMRANGEBYSCORE</code> (drop old entries), <code>ZADD</code> (add this one), a count (<code>ZRANGE</code>/<code>ZCARD</code>) and <code>EXPIRE</code> inside one <code>MULTI</code> transaction. That's a sliding window log, made atomic.</p>
+  </aside>
+  <h4>Synchronization issue</h4>
+  <p>To support millions of users you need more than one rate limiter server, and then they must share state. The web tier is stateless, so a client's requests can land on different limiters. In Figure 4-15 (right), if nothing is synchronized, rate limiter 1 has no data about client 2 and can't limit it properly.</p>
+  <figure class="fig">
+    <img src="../assets/img/p-067-048.jpg" alt="Left: client 1 to rate limiter 1 and client 2 to rate limiter 2. Right: requests cross over so each client hits the other limiter">
+    <figcaption><b>Figure 4-15</b> · Left: each client always hits the same limiter. Right: requests cross over, so each limiter sees only part of a client's traffic.</figcaption>
+  </figure>
+  <table>
+    <tr><th>Fix</th><th>How</th><th>Verdict</th></tr>
+    <tr><td><b>Sticky sessions</b></td><td>Route each client's traffic to the same rate limiter</td><td class="no">✗ Neither scalable nor flexible</td></tr>
+    <tr><td><b>Centralized data store</b></td><td>All limiters read and write counters in one shared Redis (Figure 4-16)</td><td class="yes">✓ Better approach</td></tr>
+  </table>
+  <figure class="fig medium">
+    <img src="../assets/img/p-067-049.jpg" alt="Two clients each hit a different rate limiter, and both limiters use the same Redis">
+    <figcaption><b>Figure 4-16</b> · Shared Redis means it doesn't matter which limiter a request hits.</figcaption>
+  </figure>
+
+  <h3>Performance optimization</h3>
+  <ol>
+    <li><b>Multi-data center setup.</b> Latency is high for users far from the data center, so this is crucial for a rate limiter. Most cloud providers run many edge server locations worldwide; as of May 2020, Cloudflare had <b>194</b> geographically distributed edge locations. Traffic is routed automatically to the closest edge server to reduce latency.</li>
+    <li><b>Synchronize data with an eventual consistency model.</b> (See the "Consistency" section of <a href="06-key-value-store.html">Chapter 6: Design a Key-Value Store</a>.)</li>
+  </ol>
+  <figure class="fig small">
+    <img src="../assets/img/p-068-050.jpg" alt="Map of Western Europe with many edge server dots; a user is routed to the nearest one">
+    <figcaption><b>Figure 4-17</b> · Cloudflare's edge locations: a user is routed to the nearest one.</figcaption>
+  </figure>
+
+  <h3>Monitoring</h3>
+  <p>Once the limiter is live, gather analytics to confirm that both the <b>algorithm</b> and the <b>rules</b> are effective.</p>
+  <ul>
+    <li><b>Rules too strict</b> → many valid requests are dropped → relax the rules a little.</li>
+    <li><b>Limiter fails under sudden traffic spikes</b> such as flash sales → switch to an algorithm that supports bursts. <b>Token bucket</b> is a good fit.</li>
+  </ul>
+</section>
+
+<section id="step-4">
+  <h2><span class="step-num">Step 4</span>Wrap up</h2>
+  <p class="one-liner">Recap the five algorithms, the architecture, distributed concerns, performance and monitoring. Then raise these if time allows.</p>
+  <ul>
+    <li><b>Hard vs soft rate limiting.</b>
+      <ul>
+        <li><b>Hard:</b> requests can never exceed the threshold.</li>
+        <li><b>Soft:</b> requests can exceed the threshold for a short period.</li>
+      </ul>
+    </li>
+    <li><b>Rate limiting at different levels.</b> This chapter limits at the application level (HTTP, <b>layer 7</b>). You can also limit at other layers, e.g. by IP address with <b>iptables</b> (IP, <b>layer 3</b>). The 7 layers of the <b>OSI model</b> (Open Systems Interconnection):
+      <ul class="tags">
+        <li>1 Physical</li><li>2 Data link</li><li><b>3 Network</b></li><li>4 Transport</li><li>5 Session</li><li>6 Presentation</li><li><b>7 Application</b></li>
+      </ul>
+    </li>
+    <li><b>Avoid being rate limited.</b> Client best practices:
+      <ul>
+        <li>Use a client cache to avoid making frequent API calls.</li>
+        <li>Understand the limit and don't send too many requests in a short time.</li>
+        <li>Catch exceptions and errors so the client can recover gracefully.</li>
+        <li>Add sufficient back-off time to retry logic.</li>
+      </ul>
+    </li>
+  </ul>
+</section>
+
+<section id="self-test">
+  <h2>Self-test</h2>
+  <details class="qa"><summary>Name the three benefits of a rate limiter, with an example for each.</summary><div><p>Prevent resource starvation from DoS (e.g. Twitter's 300 tweets per 3 hours), reduce cost (fewer servers; per-call third-party APIs such as credit checks and payments), and prevent server overload from bots or misbehaving users.</p></div></details>
+  <details class="qa"><summary>Why not enforce rate limiting on the client?</summary><div><p>Malicious actors can easily forge client requests, and you may not control the client implementation.</p></div></details>
+  <details class="qa"><summary>When should the rate limiter go in an API gateway rather than your own server-side code?</summary><div><p>When you already run microservices with an API gateway (for authentication, IP whitelisting, etc.), or lack the engineering resources to build your own. The catch: a third-party gateway may limit your choice of algorithm.</p></div></details>
+  <details class="qa"><summary>How does the token bucket algorithm work, and what are its two parameters?</summary><div><p>A refiller adds tokens at a fixed rate up to the bucket's capacity (extras overflow). Each request takes one token; no token means the request is dropped. Parameters: <b>bucket size</b> and <b>refill rate</b>.</p></div></details>
+  <details class="qa"><summary>A user may post once per second, add 150 friends per day and like 5 posts per second. How many token buckets per user? What about per-IP limiting, or a 10,000 req/s system-wide cap?</summary><div><p>3 buckets per user (one per endpoint). One bucket per IP address. One global bucket shared by all requests.</p></div></details>
+  <details class="qa"><summary>How does the leaking bucket differ from the token bucket, and what's its main drawback?</summary><div><p>Requests go into a FIFO queue (dropped if full) and are processed at a <b>fixed outflow rate</b>. A burst fills the queue with old requests, so recent requests get rate limited if the old ones aren't processed in time.</p></div></details>
+  <details class="qa"><summary>What's the fixed window counter's major flaw? Use the book's numbers.</summary><div><p>Bursts at window edges. Limit 5/min: 5 requests between 2:00:30 and 2:01:00 plus 5 between 2:01:00 and 2:01:30 means 10 pass in the one-minute window 2:00:30–2:01:30, twice the limit.</p></div></details>
+  <details class="qa"><summary>Sliding window log, limit 2/min. Requests arrive at 1:00:01, 1:00:30, 1:00:50 and 1:01:40. Which are accepted?</summary><div><p>Accepted, accepted, <b>rejected</b> (log size 3, but its timestamp stays logged), accepted (1:00:01 and 1:00:30 fall before 1:00:40 and are removed, leaving 2). Accurate in any rolling window, but memory-hungry.</p></div></details>
+  <details class="qa"><summary>Sliding window counter: limit 7/min, 5 requests last minute, 3 this minute, new request 30% into the minute. Allowed?</summary><div><p>3 + 5 × 0.7 = 6.5, rounded down to 6, which is under 7, so yes. It's an approximation, but Cloudflare found only 0.003% of 400 million requests wrongly allowed or limited.</p></div></details>
+  <details class="qa"><summary>Why store counters in Redis rather than a database, and which two commands do you use?</summary><div><p>Disk access is too slow; an in-memory cache is fast and supports time-based expiration. <code>INCR</code> increments the counter; <code>EXPIRE</code> sets a timeout after which the counter is deleted.</p></div></details>
+  <details class="qa"><summary>What does a throttled client receive, and which headers help clients avoid throttling?</summary><div><p>HTTP <b>429 Too Many Requests</b> with <code>X-Ratelimit-Retry-After</code>. Responses also carry <code>X-Ratelimit-Remaining</code> and <code>X-Ratelimit-Limit</code>.</p></div></details>
+  <details class="qa"><summary>Describe the race condition in a distributed rate limiter and how to fix it without locks.</summary><div><p>Counter is 3; two requests read 3 concurrently, each writes 4, but it should be 5. Locks work but slow the system significantly; use a <b>Lua script</b> or Redis <b>sorted sets</b> instead.</p></div></details>
+  <details class="qa"><summary>You run several rate limiter servers. Why not use sticky sessions, and what's better?</summary><div><p>Sticky sessions are neither scalable nor flexible. Use a <b>centralized data store such as Redis</b> that every limiter reads and writes.</p></div></details>
+  <details class="qa"><summary>Monitoring shows the limiter breaks down during flash sales. What do you change?</summary><div><p>Switch to an algorithm that supports burst traffic, such as the <b>token bucket</b>. (If valid requests are being dropped in general, relax the rules instead.)</p></div></details>
+  <details class="qa"><summary>What's the difference between hard and soft rate limiting, and at which other OSI layer can you limit?</summary><div><p>Hard: requests can never exceed the threshold. Soft: they can exceed it for a short period. Besides layer 7 (HTTP), you can limit by IP address at layer 3, e.g. with iptables.</p></div></details>
+</section>
+
+<section id="glossary">
+  <h2>Terms to know</h2>
+  <dl class="glossary">
+    <dt>Rate limiter</dt><dd>Controls how many requests a client or service can send in a time period; excess calls are blocked.</dd>
+    <dt>HTTP 429</dt><dd>"Too Many Requests": the status code returned when a request is rate limited.</dd>
+    <dt>Token bucket</dt><dd>Requests spend tokens that refill at a fixed rate up to a capacity; allows short bursts.</dd>
+    <dt>Leaking bucket</dt><dd>A FIFO queue of requests drained at a fixed outflow rate; full queue means drop.</dd>
+    <dt>API gateway</dt><dd>Managed middleware in front of services handling rate limiting, SSL termination, authentication, IP whitelisting, static content.</dd>
+    <dt>INCR / EXPIRE</dt><dd>Redis commands: add 1 to a counter / delete it automatically after a timeout.</dd>
+    <dt>Race condition</dt><dd>Concurrent read-then-write operations overwrite each other, leaving a wrong counter.</dd>
+    <dt>Lua script</dt><dd>A script Redis executes as one atomic unit; used to make check-and-increment safe.</dd>
+    <dt>Sorted set</dt><dd>A Redis structure of members ordered by score (here, timestamps); used for sliding window logs.</dd>
+    <dt>Sticky session</dt><dd>Routing a client to the same server every time; rejected here as unscalable and inflexible.</dd>
+    <dt>Eventual consistency</dt><dd>Replicas may briefly disagree but converge over time; used here to sync rate limiter data.</dd>
+    <dt>Edge server</dt><dd>A server in a location close to users, so traffic travels less distance.</dd>
+  </dl>
+  <details class="more refs"><summary>Book references (go deeper)</summary><div><ol>
+    <li><a href="https://cloud.google.com/solutions/rate-limiting-strategies-techniques">Rate-limiting strategies and techniques</a></li>
+    <li><a href="https://developer.twitter.com/en/docs/basics/rate-limits">Twitter rate limits</a></li>
+    <li><a href="https://developers.google.com/docs/api/limits">Google docs usage limits</a></li>
+    <li><a href="https://www.ibm.com/cloud/learn/microservices">IBM microservices</a></li>
+    <li><a href="https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-request-throttling.html">Throttle API requests for better throughput</a></li>
+    <li><a href="https://stripe.com/blog/rate-limiters">Stripe rate limiters</a></li>
+    <li><a href="https://help.shopify.com/en/api/reference/rest-admin-api-rate-limits">Shopify REST Admin API rate limits</a></li>
+    <li><a href="https://engineering.classdojo.com/blog/2015/02/06/rolling-rate-limiter/">Better Rate Limiting With Redis Sorted Sets</a></li>
+    <li><a href="https://medium.com/@saisandeepmopuri/system-design-rate-limiter-and-data-modelling-9304b0d18250">System Design — Rate limiter and Data modelling</a></li>
+    <li><a href="https://blog.cloudflare.com/counting-things-a-lot-of-different-things/">How we built rate limiting capable of scaling to millions of domains</a></li>
+    <li><a href="https://redis.io/">Redis website</a></li>
+    <li><a href="https://github.com/lyft/ratelimit">Lyft rate limiting</a></li>
+    <li><a href="https://gist.github.com/ptarjan/e38f45f2dfe601419ca3af937fff574d#request-rate-limiter">Scaling your API with rate limiters</a></li>
+    <li><a href="https://www.cloudflare.com/learning/serverless/glossary/what-is-edge-computing/">What is edge computing</a></li>
+    <li><a href="https://blog.programster.org/rate-limit-requests-with-iptables">Rate Limit Requests with Iptables</a></li>
+    <li><a href="https://en.wikipedia.org/wiki/OSI_model#Layer_architecture">OSI model</a></li>
+  </ol></div></details>
+</section>
+
+</main>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var LIMIT = 4, PERIOD = 4000, SPAN = 16000;
+  // t = integer ms since reset. Tokens are stored as (tokens x period) so refill math stays exact:
+  // each ms adds `limit` units, one token = `period` units.
+  function makeLimiter(mode, limit, period) {
+    var cap = limit * period, bucket = cap, last = 0, win = 0, count = 0;
+    function sync(t) {
+      if (mode === "token") { bucket = Math.min(cap, bucket + (t - last) * limit); last = t; }
+      else if (Math.floor(t / period) !== win) { win = Math.floor(t / period); count = 0; }
+    }
+    function view(t) {
+      sync(t);
+      if (mode === "token") {
+        var left = Math.floor(bucket / period), part = bucket % period;
+        return { left: left, frac: left < limit ? part / period : 0, next: left < limit ? Math.ceil((period - part) / limit) : 0 };
+      }
+      return { left: limit - count, frac: 0, winStart: win * period, next: (win + 1) * period - t };
+    }
+    return {
+      view: view,
+      hit: function (t) {
+        sync(t);
+        var ok = mode === "token" ? bucket >= period : count < limit;
+        if (ok && mode === "token") bucket -= period;
+        else if (ok) count++;
+        return ok;
+      }
+    };
+  }
+  var lim, events, t0, mode;
+  function now() { return Math.round(performance.now() - t0); }
+  function reset() {
+    mode = $("rl-mode").value; lim = makeLimiter(mode, LIMIT, PERIOD); events = []; t0 = performance.now();
+    $("rl-last").textContent = "Fire a request.";
+    draw();
+  }
+  function fire(n) {
+    var t = now(), ok = 0;
+    for (var k = 0; k < n; k++) { var r = lim.hit(t); if (r) ok++; events.push({ t: t, ok: r, k: k }); }
+    var v = lim.view(t), msg = ok ? ok + " × <b style='color:var(--yes)'>200 OK</b>" : "";
+    if (n > ok) msg += (ok ? " · " : "") + (n - ok) + " × <b style='color:var(--no)'>429 Too Many Requests</b> · X-Ratelimit-Retry-After: " + Math.max(1, Math.ceil(v.next / 1000));
+    else msg += " · X-Ratelimit-Remaining: " + v.left;
+    $("rl-last").innerHTML = "→ " + msg + " · X-Ratelimit-Limit: " + LIMIT;
+    draw();
+  }
+  function draw() {
+    var t = now(), v = lim.view(t), h = "", i;
+    for (i = 0; i < LIMIT; i++) {
+      var f = i < v.left ? 100 : i === v.left ? Math.round(v.frac * 100) : 0;
+      h += '<span style="width:26px;height:26px;border-radius:50%;border:2px solid var(--accent);background:linear-gradient(to top,var(--accent) ' + f + '%,transparent ' + f + '%)"></span>';
+    }
+    $("rl-slots").innerHTML = h;
+    $("rl-state").textContent = mode === "token"
+      ? "Tokens: " + v.left + " / " + LIMIT + (v.left < LIMIT ? " · next token in " + (v.next / 1000).toFixed(1) + " s" : " · bucket full, new tokens overflow")
+      : "Window " + v.winStart / 1000 + "–" + (v.winStart + PERIOD) / 1000 + " s · used " + (LIMIT - v.left) + " / " + LIMIT + " · resets in " + (v.next / 1000).toFixed(1) + " s";
+    h = "";
+    if (mode === "fixed") {
+      for (var b = Math.max(0, Math.ceil((t - SPAN) / PERIOD) * PERIOD); b <= t; b += PERIOD)
+        h += '<i style="position:absolute;top:0;bottom:0;left:' + (100 - (t - b) / SPAN * 100) + '%;border-left:2px dashed var(--ink-2)"></i>';
+    }
+    events = events.filter(function (e) { return t - e.t < SPAN; });
+    for (i = 0; i < events.length; i++) {
+      var e = events[i];
+      h += '<i style="position:absolute;width:6px;height:5px;top:' + (3 + e.k * 6) + 'px;left:calc(' + (100 - (t - e.t) / SPAN * 100) + '% - 6px);background:var(--' + (e.ok ? "yes" : "no") + ')"></i>';
+    }
+    $("rl-line").innerHTML = h;
+  }
+  $("rl-mode").onchange = reset;
+  $("rl-one").onclick = function () { fire(1); };
+  $("rl-burst").onclick = function () { fire(5); };
+  $("rl-reset").onclick = reset;
+  reset();
+  setInterval(draw, 100);
+})();
+</script>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

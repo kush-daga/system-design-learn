@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 2 · Back-of-the-Envelope Estimation — SDI Fast Track</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem("sdi:theme");if(t)document.documentElement.dataset.theme=JSON.parse(t)}catch(e){}</script>
+</head>
+<body data-root=".." data-chapter="2">
+<main id="content" class="chapter">
+
+<header class="chapter-hero">
+  <p class="eyebrow">Chapter 2 · Foundations</p>
+  <h1>Back-of-the-Envelope Estimation</h1>
+  <p class="lede">The few numbers you need to size a system on a whiteboard (powers of two, latencies, nines of availability) and the routine for turning users into QPS and storage, worked through on the book's Twitter example.</p>
+  <div class="meta-row"></div>
+  <ul class="pace">
+    <li><a href="#tldr">⚡ TL;DR <small>2 min</small></a></li>
+    <li><a href="#skeleton">🗣 Interview answer <small>2 min</small></a></li>
+    <li><a href="#basics">📖 Full walkthrough</a></li>
+    <li><a href="#self-test">🧠 Self-test</a></li>
+  </ul>
+</header>
+
+<section id="tldr" class="tldr">
+  <h2>TL;DR</h2>
+  <ul>
+    <li><b>Goal:</b> quick estimates from thought experiments and common performance numbers that show which designs meet the requirements. The <b>process</b> is graded, not precision.</li>
+    <li><b>Powers of two:</b> 2<sup>10</sup> ≈ thousand (KB), 2<sup>20</sup> ≈ million (MB), 2<sup>30</sup> ≈ billion (GB), 2<sup>40</sup> ≈ trillion (TB), 2<sup>50</sup> ≈ quadrillion (PB). 1 ASCII character = 1 byte = 8 bits.</li>
+    <li><b>Latency lessons:</b> memory is fast, disk is slow: avoid disk seeks. Compression is cheap: compress before sending over the internet. Cross-region trips are slow.</li>
+    <li><b>Availability:</b> each extra nine cuts downtime 10×: 99.9% ≈ 8.77 h/year, 99.99% ≈ 52.6 min/year. Big cloud SLAs are ≥ 99.9%.</li>
+    <li><b>QPS</b> = DAU × actions per day ÷ 86,400 s (≈ 10<sup>5</sup>). <b>Peak QPS</b> ≈ 2 × QPS.</li>
+    <li><b>Storage</b> = items per day × size × 365 × years.</li>
+    <li><b>Twitter example:</b> 150 M DAU × 2 tweets → ~3,500 QPS, ~7,000 peak. 10% carry 1 MB media → 30 TB/day → ~55 PB over 5 years.</li>
+    <li><b>Tips:</b> round aggressively, write assumptions down, label every unit.</li>
+  </ul>
+  <div class="stats">
+    <div class="stat"><b>100 ns</b><span>main memory reference</span></div>
+    <div class="stat"><b>0.5 ms</b><span>round trip inside one datacenter</span></div>
+    <div class="stat"><b>10 ms</b><span>disk seek</span></div>
+    <div class="stat"><b>150 ms</b><span>California ↔ Netherlands round trip</span></div>
+  </div>
+</section>
+
+<section id="skeleton">
+  <h2>How to use this in an interview</h2>
+  <p class="one-liner">Estimation is a routine, not mental gymnastics. Run these moves out loud and write each line on the board.</p>
+  <ol class="framework">
+    <li><b>Check it's wanted, then list assumptions</b> Ask whether the interviewer wants numbers before diving in. Write every assumption down: users, % active daily, actions per user, item size, % with media, retention.</li>
+    <li><b>Users → DAU → QPS</b> DAU × actions per day ÷ 86,400 s. Treat a day as ≈ 10<sup>5</sup> seconds and round freely.</li>
+    <li><b>Peak QPS</b> Multiply by a peak factor (the book uses 2×) and say which factor you chose.</li>
+    <li><b>Storage</b> Items per day × size, then × 365 × years. Put a unit on every number.</li>
+    <li><b>Use the result</b> Check that your blueprint fits the scale, and extend to the other common asks: cache size and number of servers.</li>
+  </ol>
+</section>
+
+<section id="basics">
+  <h2>What estimation is for</h2>
+  <p class="one-liner">Estimates tell you <b>which designs can meet the requirements</b> before you build anything.</p>
+  <p>Jeff Dean (Google Senior Fellow) defines <b>back-of-the-envelope calculations</b> as "estimates you create using a combination of thought experiments and common performance numbers to get a good feel for which designs will meet your requirements."</p>
+  <p>Interviewers sometimes ask you to estimate system capacity or performance this way. You need three basics, covered next: <a href="#power-of-two">power of two</a>, <a href="#latency">latency numbers every programmer should know</a>, and <a href="#availability">availability numbers</a>.</p>
+</section>
+
+<section id="power-of-two">
+  <h2>Power of two</h2>
+  <p class="one-liner">However big the data, the arithmetic reduces to <b>data-volume units based on powers of 2</b>.</p>
+  <p>A <b>byte</b> is 8 bits. An ASCII character uses one byte.</p>
+  <table>
+    <tr><th>Power</th><th>Approximate value</th><th>Full name</th><th>Short name</th></tr>
+    <tr><td>2<sup>10</sup></td><td>1 Thousand</td><td>1 Kilobyte</td><td>1 KB</td></tr>
+    <tr><td>2<sup>20</sup></td><td>1 Million</td><td>1 Megabyte</td><td>1 MB</td></tr>
+    <tr><td>2<sup>30</sup></td><td>1 Billion</td><td>1 Gigabyte</td><td>1 GB</td></tr>
+    <tr><td>2<sup>40</sup></td><td>1 Trillion</td><td>1 Terabyte</td><td>1 TB</td></tr>
+    <tr><td>2<sup>50</sup></td><td>1 Quadrillion</td><td>1 Petabyte</td><td>1 PB</td></tr>
+  </table>
+  <p style="font-size:15px;color:var(--ink-3)">Table 2-1. Each step up is ×1,024 ≈ ×1,000, so converting units means adding or removing three zeros: 30 million × 1 MB = 30 TB.</p>
+</section>
+
+<section id="latency">
+  <h2>Latency numbers every programmer should know</h2>
+  <p class="one-liner">Exact values age, but the <b>ratios between memory, disk and network</b> still decide designs.</p>
+  <p>Jeff Dean published the length of typical computer operations in 2010 (Table 2-2). Computers have since become faster, so some numbers are outdated, but they still show which operations are fast and which are slow. A Google engineer later built a tool that projects the numbers forward in time; its 2020 values (Figure 2-1) are in the right-hand column.</p>
+  <table>
+    <tr><th>Operation</th><th>Dean, 2010 (Table 2-2)</th><th>2020 (Figure 2-1)</th></tr>
+    <tr><td>L1 cache reference</td><td>0.5 ns</td><td>1 ns</td></tr>
+    <tr><td>Branch mispredict</td><td>5 ns</td><td>3 ns</td></tr>
+    <tr><td>L2 cache reference</td><td>7 ns</td><td>4 ns</td></tr>
+    <tr><td>Mutex lock/unlock</td><td>100 ns</td><td>17 ns</td></tr>
+    <tr><td><b>Main memory reference</b></td><td><b>100 ns</b></td><td>100 ns</td></tr>
+    <tr><td>Compress 1 KB with Zippy</td><td>10,000 ns = 10 µs</td><td>2,000 ns ≈ 2 µs</td></tr>
+    <tr><td>Send 2 KB over the network</td><td>20,000 ns = 20 µs (1 Gbps)</td><td>44 ns (commodity network)</td></tr>
+    <tr><td>SSD random read</td><td>—</td><td>16,000 ns ≈ 16 µs</td></tr>
+    <tr><td>Read 1 MB sequentially from memory</td><td>250,000 ns = 250 µs</td><td>3,000 ns ≈ 3 µs</td></tr>
+    <tr><td>Read 1 MB sequentially from SSD</td><td>—</td><td>49,000 ns ≈ 49 µs</td></tr>
+    <tr><td><b>Round trip within the same datacenter</b></td><td><b>500,000 ns = 500 µs</b></td><td>500 µs</td></tr>
+    <tr><td><b>Disk seek</b></td><td><b>10,000,000 ns = 10 ms</b></td><td>2,000,000 ns ≈ 2 ms</td></tr>
+    <tr><td>Read 1 MB sequentially from the network</td><td>10,000,000 ns = 10 ms</td><td>—</td></tr>
+    <tr><td>Read 1 MB sequentially from disk</td><td>30,000,000 ns = 30 ms</td><td>825,000 ns ≈ 825 µs</td></tr>
+    <tr><td><b>Send packet California → Netherlands → California</b></td><td><b>150,000,000 ns = 150 ms</b></td><td>150 ms</td></tr>
+  </table>
+  <p style="font-size:15px;color:var(--ink-3)">Units: 1 ns = 10<sup>−9</sup> s. 1 µs = 10<sup>−6</sup> s = 1,000 ns. 1 ms = 10<sup>−3</sup> s = 1,000 µs = 1,000,000 ns.</p>
+  <figure class="fig">
+    <img src="../assets/img/p-037-028.jpg" alt="Latency numbers as of 2020 drawn as grids of colored squares: black squares are 1 ns, blue 100 ns, green 10 microseconds, red 1 ms; the cross-continent round trip is a large red block">
+    <figcaption><b>Figure 2-1</b> · Latencies as of 2020, drawn to scale. Each color is 100× the one before (black 1 ns → blue 100 ns → green 10 µs → red 1 ms). Compare the tiny memory entries with the big red block for California ↔ Netherlands.</figcaption>
+  </figure>
+
+  <h3>What the numbers tell you</h3>
+  <table>
+    <tr><th>Conclusion</th><th>The numbers behind it</th></tr>
+    <tr><td><b>Memory is fast but the disk is slow.</b></td><td>Memory reference 100 ns vs disk seek 10 ms (~100,000×). Reading 1 MB: 250 µs from memory vs 30 ms from disk.</td></tr>
+    <tr><td><b>Avoid disk seeks if possible.</b></td><td>One 10 ms seek costs as much as 20 round trips inside a datacenter.</td></tr>
+    <tr><td><b>Simple compression algorithms are fast.</b></td><td>Compressing 1 KB with Zippy: 10 µs (2 µs by 2020).</td></tr>
+    <tr><td><b>Compress data before sending it over the internet if possible.</b></td><td>Compressing costs microseconds; network transfers cost milliseconds.</td></tr>
+    <tr><td><b>Data centers are usually in different regions, and sending data between them takes time.</b></td><td>Round trip in one datacenter: 0.5 ms. California ↔ Netherlands: 150 ms (300×).</td></tr>
+  </table>
+  <aside class="callout note">
+    <span class="callout-label">Beyond the book</span>
+    <p>The 2020 column comes from a tool that projects old hardware trends forward rather than measuring hardware, so treat its disk and network values as optimistic. A spinning-disk seek still takes several milliseconds, and sending 2 KB in 44 ns would need about 360 Gbps. Remember the orders of magnitude, not the exact values.</p>
+  </aside>
+</section>
+
+<section id="availability">
+  <h2>Availability numbers</h2>
+  <p class="one-liner">Uptime is quoted in <b>nines</b>. Each extra nine divides the allowed downtime by 10.</p>
+  <p><b>High availability</b> is the ability of a system to stay continuously operational for a desirably long time. It's measured as a percentage: 100% means zero downtime, and most services fall between 99% and 100%.</p>
+  <p>A <b>service level agreement (SLA)</b> is an agreement between you (the service provider) and your customer that formally defines the level of uptime your service will deliver. Amazon, Google and Microsoft set their cloud SLAs at <b>99.9% or above</b>.</p>
+  <table>
+    <tr><th>Availability</th><th>Nines</th><th>Downtime per day</th><th>Downtime per year</th></tr>
+    <tr><td>99%</td><td>2</td><td>14.40 minutes</td><td>3.65 days</td></tr>
+    <tr><td>99.9%</td><td>3</td><td>1.44 minutes</td><td>8.77 hours</td></tr>
+    <tr><td>99.99%</td><td>4</td><td>8.64 seconds</td><td>52.60 minutes</td></tr>
+    <tr><td>99.999%</td><td>5</td><td>864.00 milliseconds</td><td>5.26 minutes</td></tr>
+    <tr><td>99.9999%</td><td>6</td><td>86.40 milliseconds</td><td>31.56 seconds</td></tr>
+  </table>
+  <p style="font-size:15px;color:var(--ink-3)">Table 2-3. Downtime = (100% − availability) × period. Example: 0.1% of 1,440 minutes a day = 1.44 minutes.</p>
+  <aside class="callout note">
+    <span class="callout-label">Beyond the book</span>
+    <p>Availabilities multiply when a request must pass through several components in series: two services at 99.9% each give 99.9% × 99.9% ≈ <b>99.8%</b>. Redundant copies in parallel help: two independent 99.9% replicas give 1 − 0.001² = <b>99.9999%</b>.</p>
+  </aside>
+</section>
+
+<section id="twitter-example">
+  <h2>Worked example: Twitter QPS and storage</h2>
+  <p class="one-liner">State the assumptions, then turn <b>users into DAU, DAU into QPS, and posts into bytes</b>.</p>
+  <p>These numbers are for the exercise only; they are not Twitter's real numbers.</p>
+  <h4>Assumptions</h4>
+  <table>
+    <tr><th>Assumption</th><th>Value</th></tr>
+    <tr><td>Monthly active users (MAU)</td><td>300 million</td></tr>
+    <tr><td>Share of users active daily</td><td>50%</td></tr>
+    <tr><td>Tweets per user per day (average)</td><td>2</td></tr>
+    <tr><td>Tweets containing media</td><td>10%</td></tr>
+    <tr><td>Data retention</td><td>5 years</td></tr>
+    <tr><td>Tweet size</td><td><code>tweet_id</code> 64 bytes · text 140 bytes · media 1 MB</td></tr>
+  </table>
+  <h4>Estimates</h4>
+<pre><code>DAU            = 300 million × 50%                        = 150 million
+Tweet QPS      = 150 million × 2 tweets ÷ 24 h ÷ 3,600 s  ≈ 3,500
+Peak QPS       = 2 × QPS                                  ≈ 7,000
+
+Media per day  = 150 million × 2 × 10% × 1 MB             = 30 TB
+Media, 5 years = 30 TB × 365 × 5                          ≈ 55 PB</code></pre>
+  <p>The book estimates <b>media storage only</b>. That's reasonable: IDs and text add 300 million × (64 + 140) bytes ≈ 61 GB a day, about 0.2% of the media volume. (Chapter 7's Snowflake IDs are 64 <i>bits</i> = 8 bytes, so the book's 64-byte <code>tweet_id</code> is a generous over-estimate. It doesn't change the result.)</p>
+  <aside class="callout key">
+    <span class="callout-label">Key idea</span>
+    <p>A day has 86,400 seconds, roughly 10<sup>5</sup>. So <b>QPS ≈ requests per day ÷ 100,000</b> (slightly low; divide by 86,400 for the exact figure). One million requests a day is about 12 per second.</p>
+  </aside>
+
+  <div class="demo" id="est-demo">
+    <span class="demo-title">Try it · QPS and storage estimator</span>
+    <p style="font-size:15px;margin-bottom:10px">Prefilled with the book's Twitter assumptions. Change any input and the arithmetic updates. (To size text instead, set media to 100% and the size to the bytes per post.)</p>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;align-items:end;font-size:14px;margin-bottom:12px">
+      <label>Monthly active users (millions)<br><input id="e-mau" type="number" min="0" step="any" style="width:100%"></label>
+      <label>% of users active daily<br><input id="e-daily" type="number" min="0" max="100" step="any" style="width:100%"></label>
+      <label>Posts per user per day<br><input id="e-acts" type="number" min="0" step="any" style="width:100%"></label>
+      <label>Peak factor (× average QPS)<br><input id="e-peak" type="number" min="0" step="any" style="width:100%"></label>
+      <label>% of posts with media<br><input id="e-pct" type="number" min="0" max="100" step="any" style="width:100%"></label>
+      <label>Media size per post<br><span style="display:flex;gap:6px"><input id="e-size" type="number" min="0" step="any" style="width:60%"><select id="e-unit" aria-label="Size unit"><option value="0">B</option><option value="1">KB</option><option value="2">MB</option><option value="3">GB</option></select></span></label>
+      <label>Retention (years)<br><input id="e-years" type="number" min="0" step="any" style="width:100%"></label>
+    </div>
+    <button class="btn" id="e-reset" type="button">Reset to book example</button>
+    <div class="out" id="e-out" style="margin-top:12px;line-height:1.9"></div>
+  </div>
+</section>
+
+<section id="tips">
+  <h2>Tips</h2>
+  <p class="one-liner">Estimation is about the <b>process</b>. Interviewers are testing how you solve problems, not your arithmetic.</p>
+  <ul>
+    <li><b>Round and approximate.</b> Complicated math is hard in an interview and precision isn't expected. "99,987 / 9.1" becomes "100,000 / 10" = 10,000.</li>
+    <li><b>Write down your assumptions</b> so you can refer back to them later.</li>
+    <li><b>Label your units.</b> A bare "5" could mean 5 KB or 5 MB and can confuse even you. Write "5 MB".</li>
+    <li><b>Practice the commonly asked estimates:</b> QPS, peak QPS, storage, cache, number of servers.</li>
+  </ul>
+</section>
+
+<section id="self-test">
+  <h2>Self-test</h2>
+  <details class="qa"><summary>What do 2<sup>10</sup>, 2<sup>20</sup>, 2<sup>30</sup>, 2<sup>40</sup> and 2<sup>50</sup> bytes approximately equal?</summary><div><p>A thousand (1 KB), a million (1 MB), a billion (1 GB), a trillion (1 TB) and a quadrillion (1 PB) bytes.</p></div></details>
+  <details class="qa"><summary>Put these in order, fastest first: disk seek, L1 cache reference, round trip within a datacenter, main memory reference, California ↔ Netherlands round trip.</summary><div><p>L1 cache (0.5 ns) → main memory (100 ns) → datacenter round trip (500 µs) → disk seek (10 ms) → California ↔ Netherlands (150 ms).</p></div></details>
+  <details class="qa"><summary>Roughly how much slower is a disk seek than a main memory reference?</summary><div><p>About 100,000×: 10 ms vs 100 ns.</p></div></details>
+  <details class="qa"><summary>What five conclusions does the book draw from the latency numbers?</summary><div><ul><li>Memory is fast but the disk is slow.</li><li>Avoid disk seeks if possible.</li><li>Simple compression algorithms are fast.</li><li>Compress data before sending it over the internet if possible.</li><li>Data centers are in different regions, and sending data between them takes time.</li></ul></div></details>
+  <details class="qa"><summary>How much downtime does 99.99% availability allow per year? Per day?</summary><div><p>About 52.6 minutes per year, or 8.64 seconds per day.</p></div></details>
+  <details class="qa"><summary>What is an SLA, and where do the big cloud providers set theirs?</summary><div><p>A service level agreement: a formal agreement between a service provider and its customer defining the level of uptime the service will deliver. Amazon, Google and Microsoft set theirs at 99.9% or above.</p></div></details>
+  <details class="qa"><summary>Walk through the Twitter QPS estimate.</summary><div><p>300 M MAU × 50% = 150 M DAU. 150 M × 2 tweets ÷ 86,400 s ≈ <b>3,500 QPS</b>. Peak = 2 × QPS ≈ <b>7,000</b>.</p></div></details>
+  <details class="qa"><summary>Walk through the Twitter media storage estimate.</summary><div><p>150 M DAU × 2 tweets × 10% with media × 1 MB = <b>30 TB per day</b>. × 365 × 5 years ≈ <b>55 PB</b>.</p></div></details>
+  <details class="qa"><summary>Why is it fine to estimate only media storage in the Twitter example?</summary><div><p>IDs and text are tiny by comparison: 300 M tweets × ~204 bytes ≈ 61 GB a day, about 0.2% of the 30 TB of media.</p></div></details>
+  <details class="qa"><summary>What's a quick way to convert requests per day into QPS?</summary><div><p>A day has 86,400 s ≈ 10<sup>5</sup>, so divide daily requests by ~100,000. For example, 1 million a day ≈ 12 per second.</p></div></details>
+  <details class="qa"><summary>How should you handle "99,987 / 9.1" in an interview?</summary><div><p>Round it: 100,000 / 10 = 10,000. Precision isn't expected; the process is what's graded.</p></div></details>
+  <details class="qa"><summary>Why does the book insist on labeling units?</summary><div><p>A bare "5" could mean 5 KB or 5 MB, which can confuse you later. Writing "5 MB" removes the ambiguity.</p></div></details>
+  <details class="qa"><summary>Which back-of-the-envelope estimates are most commonly asked?</summary><div><p>QPS, peak QPS, storage, cache and number of servers.</p></div></details>
+</section>
+
+<section id="glossary">
+  <h2>Terms to know</h2>
+  <dl class="glossary">
+    <dt>Back-of-the-envelope estimation</dt><dd>A rough estimate from thought experiments and common performance numbers, used to judge which designs meet the requirements.</dd>
+    <dt>QPS</dt><dd>Queries per second: average request rate, usually DAU × actions per day ÷ 86,400.</dd>
+    <dt>Peak QPS</dt><dd>The highest expected request rate; the book assumes 2 × average QPS.</dd>
+    <dt>DAU / MAU</dt><dd>Daily / monthly active users.</dd>
+    <dt>Latency</dt><dd>How long an operation takes, from nanoseconds (cache) to hundreds of milliseconds (cross-continent network).</dd>
+    <dt>ns, µs, ms</dt><dd>Nanosecond (10<sup>−9</sup> s), microsecond (10<sup>−6</sup> s), millisecond (10<sup>−3</sup> s). Each is 1,000× the previous.</dd>
+    <dt>Disk seek</dt><dd>Moving a disk's read head to the data's location; ~10 ms in Dean's table, one of the slowest local operations.</dd>
+    <dt>Zippy</dt><dd>A simple, fast compression algorithm used at Google; the compression example in Dean's table.</dd>
+    <dt>High availability</dt><dd>A system's ability to stay operational continuously for a desirably long time, measured as a percentage of uptime.</dd>
+    <dt>SLA</dt><dd>Service level agreement: the uptime a provider formally promises its customers.</dd>
+    <dt>Nines</dt><dd>Shorthand for availability: "four nines" = 99.99%.</dd>
+  </dl>
+  <details class="more refs"><summary>Book references (go deeper)</summary><div><ol>
+    <li><a href="http://highscalability.com/blog/2011/1/26/google-pro-tip-use-back-of-the-envelope-calculations-to-choo.html">J. Dean. Google Pro Tip: Use Back-Of-The-Envelope-Calculations To Choose The Best Design</a></li>
+    <li><a href="https://github.com/donnemartin/system-design-primer">System design primer</a></li>
+    <li><a href="https://colin-scott.github.io/personal_website/research/interactive_latency.html">Latency Numbers Every Programmer Should Know (interactive)</a></li>
+    <li><a href="https://aws.amazon.com/compute/sla/">Amazon Compute Service Level Agreement</a></li>
+    <li><a href="https://cloud.google.com/compute/sla">Compute Engine Service Level Agreement (SLA)</a></li>
+    <li><a href="https://azure.microsoft.com/en-us/support/legal/sla/summary/">SLA summary for Azure services</a></li>
+  </ol></div></details>
+</section>
+
+</main>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var BOOK = { mau: 300, daily: 50, acts: 2, peak: 2, pct: 10, size: 1, unit: "2", years: 5 };
+  var UNITS = ["B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB"];
+  function num(id) { var v = parseFloat($("e-" + id).value); return isFinite(v) && v >= 0 ? v : 0; }
+  function sig(x, n) {
+    if (!x) return 0;
+    var p = Math.pow(10, Math.floor(Math.log10(Math.abs(x))) - n + 1);
+    return Math.round(x / p) * p;
+  }
+  function fmt(x) { return Number(x.toPrecision(4)).toLocaleString("en-US", { maximumFractionDigits: 3 }); }
+  function count(x) {
+    if (x >= 1e9) return fmt(x / 1e9) + " billion";
+    if (x >= 1e6) return fmt(x / 1e6) + " million";
+    return fmt(x);
+  }
+  function unitOf(b) { var i = 0; while (i < UNITS.length - 1 && b >= Math.pow(1000, i + 1)) i++; return i; }
+  function bytes(b, round) { var i = unitOf(b), v = b / Math.pow(1000, i); return fmt(round ? sig(v, 2) : v) + " " + UNITS[i]; }
+  function render() {
+    var mau = num("mau") * 1e6, daily = num("daily"), acts = num("acts"), peak = num("peak");
+    var pct = num("pct"), years = num("years"), u = parseInt($("e-unit").value, 10) || 0;
+    var size = num("size") * Math.pow(1000, u);
+    var dau = mau * daily / 100;
+    var qps = dau * acts / 86400, qpsR = sig(qps, 2), peakR = sig(peak * qpsR, 2);
+    var items = dau * acts * pct / 100, day = items * size, total = day * 365 * years;
+    var du = unitOf(day), dayV = day / Math.pow(1000, du);
+    var rows = [
+      "DAU = " + count(mau) + " × " + fmt(daily) + "% = <b>" + count(dau) + "</b>",
+      "QPS = " + count(dau) + " × " + fmt(acts) + " ÷ 86,400 s = " + fmt(qps) + " → <b>≈ " + fmt(qpsR) + "</b>",
+      "Peak QPS = " + fmt(peak) + " × " + fmt(qpsR) + " = <b>≈ " + fmt(peakR) + "</b> <small style='color:var(--ink-3)'>(exact " + fmt(peak * qps) + ")</small>",
+      "Media posts/day = " + count(dau) + " × " + fmt(acts) + " × " + fmt(pct) + "% = " + count(items),
+      "Media storage/day = " + count(items) + " × " + fmt(num("size")) + " " + UNITS[u] + " = <b>" + bytes(day) + "</b>",
+      "Media storage, " + fmt(years) + (years === 1 ? " year = " : " years = ") + bytes(day) + " × 365 × " + fmt(years) + " = " +
+        fmt(dayV * 365 * years) + " " + UNITS[du] + " → <b>≈ " + bytes(total, true) + "</b>"
+    ];
+    $("e-out").innerHTML = "<div>" + rows.join("</div><div>") + "</div>";
+  }
+  function reset() { Object.keys(BOOK).forEach(function (k) { $("e-" + k).value = BOOK[k]; }); render(); }
+  Object.keys(BOOK).forEach(function (k) { $("e-" + k).addEventListener("input", render); });
+  $("e-unit").addEventListener("change", render);
+  $("e-reset").addEventListener("click", reset);
+  reset();
+})();
+</script>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>
