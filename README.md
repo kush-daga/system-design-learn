@@ -2,7 +2,7 @@
 
 Study pages for Alex Xu's *System Design Interview – An Insider's Guide* (Vol. 1). All 16 chapters are condensed into step-by-step pages so you can get through the book quickly without losing the parts that matter.
 
-**Live site: LIVE_URL**
+**Live site: https://system-design-learn.vercel.app**
 
 ## How to read it
 
